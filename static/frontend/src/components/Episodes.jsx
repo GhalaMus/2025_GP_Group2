@@ -48,6 +48,8 @@ function normalizeStyleKey(rawStyle) {
 }
 
 function EpisodeCover({ title, coverUrl, coverThumbB64 }) {
+  const [imageFailed, setImageFailed] = useState(false);
+
   const initials = String(title || "EP")
     .split(/\s+/)
     .filter(Boolean)
@@ -58,7 +60,7 @@ function EpisodeCover({ title, coverUrl, coverThumbB64 }) {
   const fallbackDataUrl = coverThumbB64
     ? `data:image/jpeg;base64,${coverThumbB64}`
     : "";
-  const resolvedCover = coverUrl || fallbackDataUrl;
+  const resolvedCover = !imageFailed && coverUrl ? coverUrl : fallbackDataUrl;
 
   if (resolvedCover) {
     return (
@@ -67,6 +69,7 @@ function EpisodeCover({ title, coverUrl, coverThumbB64 }) {
         alt={`${title || "Episode"} cover`}
         className="h-full w-full object-cover"
         loading="lazy"
+        onError={() => setImageFailed(true)}
       />
     );
   }
@@ -326,8 +329,6 @@ export default function Episodes() {
   };
 
   const togglePlayEpisode = async (ep) => {
-    const src = resolveAudioUrl(ep?.audioUrl);
-    if (!src) return;
     setPlayerError("");
 
     if (audioRef.current && activeAudioId === ep.id) {
@@ -346,6 +347,37 @@ export default function Episodes() {
     }
 
     if (audioRef.current) audioRef.current.pause();
+
+    let src = "";
+    if (ep?.audioKey) {
+      try {
+        const res = await fetch(`${API_BASE}/api/audio/${ep.id}`, {
+          headers: authHeaders,
+          credentials: "include",
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        if (!res.ok || !data?.url) {
+          throw new Error(data?.error || "Failed to load audio");
+        }
+        src = resolveAudioUrl(data.url);
+        setEpisodes((prev) =>
+          prev.map((item) => (item.id === ep.id ? { ...item, audioUrl: data.url } : item))
+        );
+      } catch {
+        setPlayerError(t("episodes.playError"));
+        return;
+      }
+    }
+
+    if (!src) {
+      src = resolveAudioUrl(ep?.audioUrl);
+    }
+
+    if (!src) return;
 
     const nextAudio = new Audio(src);
     nextAudio.ontimeupdate = () => setPlaybackTime(nextAudio.currentTime || 0);
@@ -782,7 +814,7 @@ export default function Episodes() {
                                   e.stopPropagation();
                                   togglePlayEpisode(ep);
                                 }}
-                                disabled={!resolveAudioUrl(ep.audioUrl)}
+                                disabled={!Boolean(ep.audioKey || resolveAudioUrl(ep.audioUrl))}
                                 className="inline-flex h-9 items-center gap-1 rounded-lg border border-black/10 dark:border-white/15 px-3 text-sm font-semibold hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
                                 title={activeAudioId === ep.id && isPlaying ? t("episodes.card.pause") : t("episodes.card.play")}
                               >

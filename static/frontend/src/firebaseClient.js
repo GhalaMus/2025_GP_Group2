@@ -12,6 +12,28 @@ const firebaseConfig = {
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID,
 };
 
+const REQUIRED_FIREBASE_ENV_KEYS = [
+  "VITE_FIREBASE_API_KEY",
+  "VITE_FIREBASE_AUTH_DOMAIN",
+  "VITE_FIREBASE_PROJECT_ID",
+  "VITE_FIREBASE_STORAGE_BUCKET",
+  "VITE_FIREBASE_MESSAGING_SENDER_ID",
+  "VITE_FIREBASE_APP_ID",
+];
+
+const missingFirebaseConfigKeys = REQUIRED_FIREBASE_ENV_KEYS.filter(
+  (key) => !String(import.meta.env[key] || "").trim()
+);
+
+const firebaseConfigIssue = missingFirebaseConfigKeys.length
+  ? `Firebase client config is missing ${missingFirebaseConfigKeys.join(
+      ", "
+    )}. Add them to the frontend environment before using signup or social login.`
+  : "";
+
+if (firebaseConfigIssue && typeof window !== "undefined") {
+  console.error(firebaseConfigIssue);
+}
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -30,4 +52,17 @@ googleProvider.setCustomParameters({ prompt: "select_account" });
 githubProvider.addScope("read:user");
 githubProvider.addScope("user:email");
 
-export { auth, googleProvider, githubProvider, actionCodeSettings };
+function ensureFirebaseClientReady() {
+  if (firebaseConfigIssue) {
+    throw new Error(firebaseConfigIssue);
+  }
+}
+
+export {
+  auth,
+  googleProvider,
+  githubProvider,
+  actionCodeSettings,
+  ensureFirebaseClientReady,
+  firebaseConfigIssue,
+};

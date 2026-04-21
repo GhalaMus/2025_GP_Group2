@@ -1,26 +1,28 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createUserWithEmailAndPassword, sendEmailVerification, updateProfile } from "firebase/auth";
-import { auth, googleProvider, githubProvider, actionCodeSettings } from "../firebaseClient";
+import {
+    auth,
+    googleProvider,
+    githubProvider,
+    actionCodeSettings,
+    ensureFirebaseClientReady,
+} from "../firebaseClient";
 import { useTranslation } from "react-i18next";
 import { API_BASE } from "../utils/api";
 import {
     authenticateWithSocialProvider,
     completePendingSocialRedirect,
 } from "../utils/socialAuth";
+import {
+    clearAuthRedirectIntent,
+    getAuthRedirectIntent,
+    readHashRedirectParams,
+    storeAuthRedirectIntent,
+} from "../utils/authRedirect";
   
-function getRedirectParams() {
-    const hash = window.location.hash || "";
-    const qs = hash.includes("?") ? hash.split("?")[1] : "";
-    const params = new URLSearchParams(qs);
-    return {
-        redirect: params.get("redirect") || "",
-        id: params.get("id") || "",
-        from: params.get("from") || "",
-    };
-}
-
 function redirectAfterAuth() {
-    const { redirect, id, from } = getRedirectParams();
+    const { redirect, id, from } = getAuthRedirectIntent();
+    clearAuthRedirectIntent();
     if (redirect === "edit") {
         window.location.hash = "#/edit";
     } else if (redirect === "create") {
@@ -31,6 +33,10 @@ function redirectAfterAuth() {
     } else {
         window.location.hash = "#/";
     }
+}
+
+function normalizeEmail(value) {
+    return String(value || "").trim().toLowerCase();
 }
 
 function mapSignupError(error) {
@@ -46,13 +52,42 @@ function mapSignupError(error) {
         return "Choose a stronger password with at least 8 characters.";
     }
     if (code === "auth/operation-not-allowed") {
-        return "";
+        return "Email/password signup is disabled in Firebase. Enable Firebase Authentication > Sign-in method > Email/Password, then try again.";
     }
     if (code === "auth/unauthorized-domain") {
-        return "";
+        return "This app URL is not approved in Firebase Authentication yet. Add this domain in Firebase Authentication > Settings > Authorized domains, then try again.";
+    }
+    if (code === "auth/app-not-authorized" || code === "auth/invalid-api-key") {
+        return "Firebase Authentication is not configured correctly for this web app yet. Check the Firebase web app settings and env vars, then try again.";
+    }
+    if (code === "auth/too-many-requests") {
+        return "Too many signup attempts were made in a short time. Wait a moment, then try again.";
     }
 
-    return error?.message || "We couldn’t create your account right now. Please try again.";
+    if (code === "auth/network-request-failed") {
+        return "We couldn't reach the signup service. Check your connection and try again.";
+    }
+
+    return error?.message || "We couldn't create your account right now. Please try again.";
+}
+
+function mapVerificationSendError(error) {
+    const code = error?.code || "";
+
+    if (code === "auth/unauthorized-domain") {
+        return "Your account was created, but this domain is not approved for Firebase action emails yet. Add it in Firebase Authentication > Settings > Authorized domains, then resend the verification email from login.";
+    }
+    if (code === "auth/too-many-requests") {
+        return "Your account was created, but we hit a temporary email limit. Go to login and resend the verification email in a moment.";
+    }
+    if (code === "auth/network-request-failed") {
+        return "Your account was created, but we couldn't send the verification email right now. Go to login and resend it when you're back online.";
+    }
+    if (code === "auth/app-not-authorized" || code === "auth/invalid-api-key") {
+        return "Your account was created, but Firebase email actions are not configured correctly for this app yet. Check the Firebase web app settings, then resend the verification email from login.";
+    }
+
+    return "Your account was created, but we couldn't send the verification email right now. Go to login and resend it to finish setup.";
 }
 
 
@@ -63,6 +98,11 @@ export default function Signup() {
     const [info, setInfo] = useState("");
     const [loading, setLoading] = useState(false);
     const [verificationEmail, setVerificationEmail] = useState("");
+    const [verificationStatus, setVerificationStatus] = useState("sent");
+
+    useEffect(() => {
+        storeAuthRedirectIntent(readHashRedirectParams());
+    }, []);
 
     useEffect(() => {
         let cancelled = false;
@@ -118,6 +158,27 @@ const strengthLabels = [
 
 const pwLabel = strengthLabels[passwordScore];
 
+    const syncFirebaseSignup = async ({ idToken, displayName }) => {
+        const res = await fetch(`${API_BASE}/api/signup`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({
+                idToken,
+                name: displayName,
+            }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(
+                data?.error || "We couldn't finish setting up your WeCast account. Please try again."
+            );
+        }
+
+        return data;
+    };
+
     const onChange = (e) =>
         setForm((f) => ({
             ...f,
@@ -129,6 +190,7 @@ const pwLabel = strengthLabels[passwordScore];
         setError("");
         setInfo("");
         setVerificationEmail("");
+        setVerificationStatus("sent");
 
         const password = form.password || "";
         const hasMinLength = password.length >= 8;
@@ -151,20 +213,52 @@ const pwLabel = strengthLabels[passwordScore];
         setLoading(true);
 
         try {
+            ensureFirebaseClientReady();
+
+            const email = normalizeEmail(form.email);
+            const displayName = form.username.trim();
             const cred = await createUserWithEmailAndPassword(
                 auth,
-                form.email.trim(),
+                email,
                 form.password
             );
 
-            if (form.username.trim()) {
-                await updateProfile(cred.user, { displayName: form.username.trim() });
+            if (displayName) {
+                await updateProfile(cred.user, { displayName });
             }
 
-            await sendEmailVerification(cred.user, actionCodeSettings);
-            await auth.signOut();
+            try {
+                const idToken = await cred.user.getIdToken(true);
+                await syncFirebaseSignup({
+                    idToken,
+                    displayName,
+                });
+            } catch (syncError) {
+                console.error("SIGNUP PROFILE SYNC ERROR:", syncError);
+                await cred.user.delete().catch(async () => {
+                    await auth.signOut().catch(() => {});
+                });
+                setError(
+                    syncError?.message ||
+                    "We couldn't finish setting up your WeCast account. Please try again."
+                );
+                return;
+            }
 
-            const email = form.email.trim();
+            try {
+                await sendEmailVerification(cred.user, actionCodeSettings);
+            } catch (verificationError) {
+                console.error("SIGNUP VERIFICATION EMAIL ERROR:", verificationError);
+                await auth.signOut().catch(() => {});
+                setVerificationStatus("retry");
+                setVerificationEmail(email);
+                setInfo(mapVerificationSendError(verificationError));
+                sessionStorage.setItem("wecast:pendingVerificationEmail", email);
+                setForm({ username: "", email: "", password: "", confirmPassword: "" });
+                return;
+            }
+
+            await auth.signOut();
             setVerificationEmail(email);
             setInfo("Check your inbox to verify your email, then log in to finish creating your account.");
             sessionStorage.setItem("wecast:pendingVerificationEmail", email);
@@ -183,6 +277,7 @@ const pwLabel = strengthLabels[passwordScore];
         setLoading(true);
 
         try {
+            ensureFirebaseClientReady();
             const result = await authenticateWithSocialProvider({
                 auth,
                 provider: googleProvider,
@@ -209,6 +304,7 @@ const pwLabel = strengthLabels[passwordScore];
         setLoading(true);
 
         try {
+            ensureFirebaseClientReady();
             const result = await authenticateWithSocialProvider({
                 auth,
                 provider: githubProvider,
@@ -291,33 +387,45 @@ const pwLabel = strengthLabels[passwordScore];
                     <div className="space-y-5">
                         <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-5 py-5 text-center dark:border-emerald-500/20 dark:bg-emerald-500/10">
                             <h2 className="text-2xl font-extrabold tracking-tight text-black dark:text-white sm:text-[2rem]">
-                                Check your email
+                                {verificationStatus === "retry" ? "Account created" : "Check your email"}
                             </h2>
                             <p className="mt-3 text-sm leading-6 text-black/70 dark:text-white/70">
-                                We sent a verification link to <span className="font-semibold text-black dark:text-white">{verificationEmail}</span>.
+                                {verificationStatus === "retry" ? (
+                                    <>Your WeCast sign-up was created for <span className="font-semibold text-black dark:text-white">{verificationEmail}</span>.</>
+                                ) : (
+                                    <>We sent a verification link to <span className="font-semibold text-black dark:text-white">{verificationEmail}</span>.</>
+                                )}
                             </p>
                             <p className="mt-2 text-sm leading-6 text-black/70 dark:text-white/70">
-                                Open the email, verify your address, then return to WeCast and log in.
+                                {verificationStatus === "retry"
+                                    ? "Open the login page, sign in with the password you just created, and resend the verification email to finish setup."
+                                    : "Open the email, verify your address, then return to WeCast and log in."}
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-black/70 dark:text-white/70">
+                                Your WeCast profile becomes active after your email is verified and you log in.
                             </p>
                         </div>
 
-                        <a
-                            href="#/login"
-                            className="btn-cta w-full text-center"
-                        >
-                            Go to Login
-                        </a>
+                        <div className="flex flex-col gap-3">
+                            <a
+                                href="#/login"
+                                className="btn-primary w-full justify-center text-center"
+                            >
+                                Go to Login
+                            </a>
 
-                        <button
-                            type="button"
-                            onClick={() => {
-                                setVerificationEmail("");
-                                setInfo("");
-                            }}
-                            className="btn-secondary w-full"
-                        >
-                            Use a different email
-                        </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setVerificationEmail("");
+                                    setInfo("");
+                                    setVerificationStatus("sent");
+                                }}
+                                className="btn-secondary w-full justify-center"
+                            >
+                                Use a different email
+                            </button>
+                        </div>
                     </div>
                 ) : (
                 <form onSubmit={onSubmit} className="space-y-5">
@@ -456,7 +564,7 @@ const pwLabel = strengthLabels[passwordScore];
                                 <path d="M12 .5a12 12 0 0 0-3.793 23.4c.6.11.82-.26.82-.58v-2.02c-3.338.73-4.04-1.61-4.04-1.61-.546-1.39-1.333-1.76-1.333-1.76-1.09-.75.083-.734.083-.734 1.205.086 1.84 1.238 1.84 1.238 1.07 1.835 2.807 1.305 3.492.998.108-.79.418-1.305.76-1.604-2.665-.304-5.467-1.333-5.467-5.93 0-1.31.47-2.38 1.236-3.22-.124-.304-.536-1.527.117-3.183 0 0 1.008-.322 3.303 1.23a11.5 11.5 0 0 1 6.006 0c2.294-1.552 3.301-1.23 3.301-1.23.655 1.656.243 2.879.12 3.183.77.84 1.235 1.91 1.235 3.22 0 4.61-2.807 5.624-5.48 5.922.43.37.816 1.102.816 2.222v3.293c0 .322.216.696.826.578A12 12 0 0 0 12 .5z" />
                             </svg>
 
-                            {t("signup.continueGoogle")}
+                            {t("signup.continueGithub")}
                         </button>
                     </div>
 

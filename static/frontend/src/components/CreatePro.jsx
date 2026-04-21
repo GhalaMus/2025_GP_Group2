@@ -390,7 +390,10 @@ const getFilteredVoicesForSpeaker = (speakerIndex) => {
     const [toast, setToast] = useState(null);
     const [showExportMenu, setShowExportMenu] = useState(false);
     const [hoverKey, setHoverKey] = useState(null);
+    const [guidelineKey, setGuidelineKey] = useState("");
+    const [guidelineVisible, setGuidelineVisible] = useState(false);
     const [musicPreview, setMusicPreview] = useState(null);
+    const guidelineHideTimerRef = useRef(null);
     const voicePreviewRef = useRef(null);
     const voicePreviewCacheRef = useRef(new Map());
     const [previewLoadingVoiceId, setPreviewLoadingVoiceId] = useState("");
@@ -715,42 +718,26 @@ Qiddiya represents a powerful statement about the future Saudi Arabia is buildin
 
     /* ---------- rules ---------- */
     const STYLE_GUIDELINES = {
-        Interview: (
-            <>
-                <strong>{t("create.guidelines.tone")}:</strong> {t("create.guidelines.interview.tone")}
-                <br />
-                <strong>{t("create.guidelines.flow")}:</strong> {t("create.guidelines.interview.flow")}
-                <br />
-                <strong>{t("create.guidelines.goal")}:</strong> {t("create.guidelines.interview.goal")}
-            </>
-        ),
-        Storytelling: (
-            <>
-                <strong>{t("create.guidelines.tone")}:</strong> {t("create.guidelines.storytelling.tone")}
-                <br />
-                <strong>{t("create.guidelines.flow")}:</strong> {t("create.guidelines.storytelling.flow")}
-                <br />
-                <strong>{t("create.guidelines.goal")}:</strong> {t("create.guidelines.storytelling.goal")}
-            </>
-        ),
-        Educational: (
-            <>
-                <strong>{t("create.guidelines.tone")}:</strong> {t("create.guidelines.educational.tone")}
-                <br />
-                <strong>{t("create.guidelines.flow")}:</strong> {t("create.guidelines.educational.flow")}
-                <br />
-                <strong>{t("create.guidelines.goal")}:</strong> {t("create.guidelines.educational.goal")}
-            </>
-        ),
-        Conversational: (
-            <>
-                <strong>{t("create.guidelines.tone")}:</strong> {t("create.guidelines.conversational.tone")}
-                <br />
-                <strong>{t("create.guidelines.flow")}:</strong> {t("create.guidelines.conversational.flow")}
-                <br />
-                <strong>{t("create.guidelines.goal")}:</strong> {t("create.guidelines.conversational.goal")}
-            </>
-        ),
+        Interview: {
+            tone: t("create.guidelines.interview.tone"),
+            flow: t("create.guidelines.interview.flow"),
+            goal: t("create.guidelines.interview.goal"),
+        },
+        Storytelling: {
+            tone: t("create.guidelines.storytelling.tone"),
+            flow: t("create.guidelines.storytelling.flow"),
+            goal: t("create.guidelines.storytelling.goal"),
+        },
+        Educational: {
+            tone: t("create.guidelines.educational.tone"),
+            flow: t("create.guidelines.educational.flow"),
+            goal: t("create.guidelines.educational.goal"),
+        },
+        Conversational: {
+            tone: t("create.guidelines.conversational.tone"),
+            flow: t("create.guidelines.conversational.flow"),
+            goal: t("create.guidelines.conversational.goal"),
+        },
     };
 
     const styleCards = [
@@ -809,6 +796,41 @@ Qiddiya represents a powerful statement about the future Saudi Arabia is buildin
         Educational: t("create.styles.educational.title"),
         Conversational: t("create.styles.conversational.title"),
     }), [t]);
+
+    const activeGuidelineTarget = hoverKey || "";
+
+    useEffect(() => {
+        if (guidelineHideTimerRef.current) {
+            clearTimeout(guidelineHideTimerRef.current);
+            guidelineHideTimerRef.current = null;
+        }
+
+        if (activeGuidelineTarget) {
+            setGuidelineKey(activeGuidelineTarget);
+            const raf = requestAnimationFrame(() => setGuidelineVisible(true));
+            return () => cancelAnimationFrame(raf);
+        }
+
+        setGuidelineVisible(false);
+        guidelineHideTimerRef.current = setTimeout(() => {
+            setGuidelineKey("");
+            guidelineHideTimerRef.current = null;
+        }, 220);
+
+        return () => {
+            if (guidelineHideTimerRef.current) {
+                clearTimeout(guidelineHideTimerRef.current);
+                guidelineHideTimerRef.current = null;
+            }
+        };
+    }, [activeGuidelineTarget]);
+
+    useEffect(() => () => {
+        if (guidelineHideTimerRef.current) {
+            clearTimeout(guidelineHideTimerRef.current);
+            guidelineHideTimerRef.current = null;
+        }
+    }, []);
 
     const roleLabelFor = (role) => {
         if (role === "host") return t("create.roles.host");
@@ -1158,9 +1180,11 @@ Qiddiya represents a powerful statement about the future Saudi Arabia is buildin
 
             const previewPayload = {
             url: baseAudioUrl,
+            audioKey: data.audioKey || "",
             words: data.words || [],
             title: audioTitle,
             language: scriptLanguage,
+            category,
             };
             sessionStorage.setItem("wecast_preview", JSON.stringify(previewPayload));
 
@@ -1412,71 +1436,122 @@ const exportScript = async (format = "pdf") => {
                             <h2 className="ui-card-title flex items-center gap-2 justify-center">
                                 <Mic2 className="w-4 h-4" /> {t("create.sections.podcastStyle")}
                             </h2>
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4 justify-items-center">
-                                {styleCards.map((s) => (
-                                    <label
-                                        key={s.key}
-                                        onClick={() => setScriptStyle(s.key)}
-                                        onMouseEnter={() => setHoverKey(s.key)}
-                                        onMouseLeave={() => setHoverKey((k) => (k === s.key ? null : k))}
-                                        className={`group relative w-full max-w-xl p-4 rounded-xl border transition cursor-pointer ${
-                                            isFromStudioEntry
-                                                ? scriptStyle === s.key
-                                                    ? "border-purple-500/80 bg-white text-black dark:bg-neutral-900 dark:text-white dark:border-purple-400/70"
-                                                    : "border-purple-200/90 bg-white text-black hover:border-purple-300/95 hover:bg-white dark:bg-neutral-900 dark:text-white dark:border-white/15 dark:hover:border-purple-400/70 dark:hover:bg-neutral-900"
-                                                : scriptStyle === s.key
-                                                    ? "border-purple-400/60 bg-purple-500/10"
-                                                    : "border-neutral-300 dark:border-neutral-800 hover:bg-black/5 dark:hover:bg-white/5"
-                                        }`}
-                                    >
-                                        <div className="flex items-start gap-3">
-                                            <input type="radio" checked={scriptStyle === s.key} readOnly className="accent-purple-600 mt-1" />
-                                            <div className="w-full">
-                                                <div className="flex items-center gap-2 font-bold">
-                                                    <span className="truncate">{s.title}</span>
-                                                    {scriptStyle === s.key && (
-                                                        <span className="text-xs text-purple-500 flex items-center gap-1">
-                                                            <Check className="w-3 h-3" /> {t("create.common.selected")}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                <p className="text-sm mt-1 text-black/80 dark:text-white/80">{s.caption}</p>
-                                                <ul className="flex flex-wrap gap-2 mt-2 text-xs text-black/70 dark:text-white/70">
-                                                    {s.bullets.map((b, i) => (
-                                                        <li
-                                                            key={i}
-                                                            className={`px-2 py-1 rounded ${
-                                                                isFromStudioEntry ? "bg-purple-50 text-purple-900/85 border border-purple-100 dark:bg-purple-900/25 dark:text-purple-200 dark:border-purple-400/30" : "bg-black/5 dark:bg-white/5"
+                            <div className="mt-4 grid grid-cols-1 gap-4 justify-items-center sm:grid-cols-2">
+                                {styleCards.map((s) => {
+                                    const guideline = STYLE_GUIDELINES[s.key];
+                                    const isGuidelineMounted = guidelineKey === s.key;
+                                    const isGuidelineShown = isGuidelineMounted && guidelineVisible;
+
+                                    return (
+                                        <label
+                                            key={s.key}
+                                            onClick={() => setScriptStyle(s.key)}
+                                            onMouseEnter={() => setHoverKey(s.key)}
+                                            onMouseLeave={() => setHoverKey((k) => (k === s.key ? null : k))}
+                                            onFocusCapture={() => setHoverKey(s.key)}
+                                            onBlurCapture={(e) => {
+                                                if (!e.currentTarget.contains(e.relatedTarget)) {
+                                                    setHoverKey((k) => (k === s.key ? null : k));
+                                                }
+                                            }}
+                                            onKeyDown={(e) => {
+                                                if (e.key === "Enter" || e.key === " ") {
+                                                    e.preventDefault();
+                                                    setScriptStyle(s.key);
+                                                }
+                                            }}
+                                            tabIndex={0}
+                                            className={`group relative w-full max-w-xl rounded-xl border p-4 transition cursor-pointer ${
+                                                isGuidelineMounted ? "z-20" : "z-0"
+                                            } ${
+                                                isFromStudioEntry
+                                                    ? scriptStyle === s.key
+                                                        ? "border-purple-500/80 bg-white text-black dark:bg-neutral-900 dark:text-white dark:border-purple-400/70"
+                                                        : "border-purple-200/90 bg-white text-black hover:border-purple-300/95 hover:bg-white dark:bg-neutral-900 dark:text-white dark:border-white/15 dark:hover:border-purple-400/70 dark:hover:bg-neutral-900"
+                                                    : scriptStyle === s.key
+                                                        ? "border-purple-400/60 bg-purple-500/10"
+                                                        : "border-neutral-300 dark:border-neutral-800 hover:bg-black/5 dark:hover:bg-white/5"
+                                            }`}
+                                        >
+                                            {isGuidelineMounted && (
+                                                <div
+                                                    className={`pointer-events-none absolute inset-x-4 bottom-full mb-3 transition-[opacity,transform] duration-200 ease-out sm:inset-x-auto sm:w-[18.5rem] ${
+                                                        isRTL ? "sm:right-4" : "sm:left-4"
+                                                    } ${
+                                                        isGuidelineShown ? "translate-y-0 opacity-100" : "translate-y-2 opacity-0"
+                                                    }`}
+                                                >
+                                                    <div className="relative overflow-hidden rounded-3xl border border-white/80 bg-[linear-gradient(155deg,rgba(255,255,255,0.98)_0%,rgba(250,245,255,0.96)_54%,rgba(241,232,255,0.95)_100%)] p-4 shadow-[0_22px_50px_rgba(109,40,217,0.18)] ring-1 ring-purple-100/80 backdrop-blur-xl dark:border-white/10 dark:bg-[linear-gradient(155deg,rgba(25,19,38,0.96)_0%,rgba(45,27,78,0.94)_58%,rgba(79,35,120,0.92)_100%)] dark:ring-purple-400/20">
+                                                        <span
+                                                            className={`absolute -bottom-2 h-4 w-4 rotate-45 rounded-[4px] border-r border-b border-white/80 bg-[#f2e8ff] dark:border-white/10 dark:bg-[#512c7e] ${
+                                                                isRTL ? "right-8" : "left-8"
                                                             }`}
-                                                        >
-                                                            {b}
-                                                        </li>
-                                                    ))}
-                                                </ul>
-                                                <p className="text-xs text-purple-500 mt-2">
-                                                    {t("create.common.valid")}: {s.valid}
-                                                </p>
-                                            </div>
-                                        </div>
-                                        {hoverKey === s.key && (
-                                            <div className="absolute left-5 right-5 top-[calc(100%+30px)] z-40">
-                                                <div className="relative rounded-2xl bg-gradient-to-br from-fuchsia-500 via-purple-600 to-indigo-700 text-white shadow-[0_18px_45px_rgba(76,29,149,0.45)] border border-white/20 p-5 animate-[popoverIn_120ms_ease-out]">
-                                                    <div className="flex items-center justify-between gap-3">
-                                                        <div className="flex items-center gap-2 font-semibold tracking-wide">
-                                                            <Info className="w-4 h-4 opacity-90" />
-                                                            <span className="text-lg">{t("create.guidelines.title")}</span>
+                                                        />
+                                                        <div className="flex items-start justify-between gap-3">
+                                                            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
+                                                                <Info className="h-4 w-4 text-purple-500 dark:text-purple-300" />
+                                                                <span>{t("create.guidelines.title")}</span>
+                                                            </div>
+                                                            <span className="rounded-full border border-purple-200/80 bg-white/80 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-purple-600 shadow-sm dark:border-white/10 dark:bg-white/10 dark:text-purple-100">
+                                                                {s.title}
+                                                            </span>
                                                         </div>
-                                                        <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-white/20 border border-white/25">
-                                                            {s.title}
-                                                        </span>
+                                                        <div className="mt-3 space-y-2.5 text-sm leading-5 text-slate-700 dark:text-white/85">
+                                                            <p>
+                                                                <span className="font-semibold text-slate-950 dark:text-white">
+                                                                    {t("create.guidelines.tone")}:
+                                                                </span>{" "}
+                                                                {guideline.tone}
+                                                            </p>
+                                                            <p>
+                                                                <span className="font-semibold text-slate-950 dark:text-white">
+                                                                    {t("create.guidelines.flow")}:
+                                                                </span>{" "}
+                                                                {guideline.flow}
+                                                            </p>
+                                                            <p>
+                                                                <span className="font-semibold text-slate-950 dark:text-white">
+                                                                    {t("create.guidelines.goal")}:
+                                                                </span>{" "}
+                                                                {guideline.goal}
+                                                            </p>
+                                                        </div>
                                                     </div>
-                                                    <div className="mt-3 leading-relaxed text-[1rem] text-white/95">{STYLE_GUIDELINES[s.key]}</div>
-                                                    <span className="absolute -top-2 left-8 w-4 h-4 rotate-45 bg-purple-600 shadow-[0_8px_18px_rgba(0,0,0,0.30)] border-l border-t border-white/20" />
+                                                </div>
+                                            )}
+
+                                            <div className="flex items-start gap-3">
+                                                <input type="radio" checked={scriptStyle === s.key} readOnly className="accent-purple-600 mt-1" />
+                                                <div className="w-full">
+                                                    <div className="flex items-center gap-2 font-bold">
+                                                        <span className="truncate">{s.title}</span>
+                                                        {scriptStyle === s.key && (
+                                                            <span className="text-xs text-purple-500 flex items-center gap-1">
+                                                                <Check className="w-3 h-3" /> {t("create.common.selected")}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <p className="text-sm mt-1 text-black/80 dark:text-white/80">{s.caption}</p>
+                                                    <ul className="flex flex-wrap gap-2 mt-2 text-xs text-black/70 dark:text-white/70">
+                                                        {s.bullets.map((b, i) => (
+                                                            <li
+                                                                key={i}
+                                                                className={`px-2 py-1 rounded ${
+                                                                    isFromStudioEntry ? "bg-purple-50 text-purple-900/85 border border-purple-100 dark:bg-purple-900/25 dark:text-purple-200 dark:border-purple-400/30" : "bg-black/5 dark:bg-white/5"
+                                                                }`}
+                                                            >
+                                                                {b}
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                    <p className="text-xs text-purple-500 mt-2">
+                                                        {t("create.common.valid")}: {s.valid}
+                                                    </p>
                                                 </div>
                                             </div>
-                                        )}
-                                    </label>
-                                ))}
+                                        </label>
+                                    );
+                                })}
                             </div>
                             {errors.script_style && <p className="text-rose-500 mt-3 flex items-center gap-2 justify-center"><AlertCircle className="w-4 h-4" /> {errors.script_style}</p>}
                             <div className="mt-6 flex justify-end">

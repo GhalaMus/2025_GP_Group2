@@ -7,10 +7,30 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_PUBLIC_BASE_URL
+        sync: false
       - key: FIREBASE_STORAGE_BUCKET
         sync: false
       - key: VITE_FIREBASE_API_KEY
         sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: RESEND_FROM_NAME
+        value: WeCast
+      - key: WECAST_SUPPORT_EMAIL
+        sync: false
+      - key: WECAST_APP_URL
+        value: https://wecast-frontend.onrender.com
       - key: FLASK_ENV
         value: production
       - key: FRONTEND_ORIGINS

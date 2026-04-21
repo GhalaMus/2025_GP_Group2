@@ -1001,7 +1001,7 @@ const persistChanges = async ({
   nextSpeakers,
   nextShowTitle = showTitle,
   nextCategory = category,
-  successMessage = "Final changes saved successfully!",
+  successMessage = "Updates applied successfully!",
   regenerateAfterSave = true,
 }) => {
   const resolvedScript = String(nextScript || "");
@@ -1032,7 +1032,7 @@ const persistChanges = async ({
     console.log("Save response:", responseData);
 
     if (!res.ok) {
-      throw new Error(responseData.error || "Failed to save final changes");
+      throw new Error(responseData.error || "Failed to apply updates");
     }
 
     if (String(nextShowTitle || "").trim()) {
@@ -1114,14 +1114,14 @@ const finalizeChanges = async () => {
       nextCategory: category,
       regenerateAfterSave: shouldRegenerateAudio,
       successMessage: shouldRegenerateAudio
-        ? "Final changes saved. Audio regenerated from the new version."
-        : "Final changes saved. Title updated without regenerating audio.",
+        ? "Updates applied. Audio regenerated to match your latest edits."
+        : "Updates applied successfully.",
     });
 
     setTimeout(() => setToast(null), 3000);
   } catch (error) {
     console.error("Save error:", error);
-    setToast({ type: "error", message: error.message || "Failed to save final changes" });
+    setToast({ type: "error", message: error.message || "Failed to apply updates" });
   } finally {
     setSaving(false);
   }
@@ -1180,7 +1180,7 @@ const finalizeChanges = async () => {
 const exportScript = async (format = "pdf") => {
   try {
     if (hasUnsavedChanges) {
-      setToast({ type: "warning", message: "Please save this version as final before exporting." });
+      setToast({ type: "warning", message: "Please apply your updates before exporting." });
       setTimeout(() => setToast(null), 3000);
       return;
     }
@@ -1354,7 +1354,7 @@ const exportScript = async (format = "pdf") => {
     setIsEditingTitle(false);
     setToast({
       type: "success",
-      message: "Title updated in your draft. Finalize changes when you're done editing.",
+      message: "Title updated in your draft. Apply updates when you're ready.",
     });
     setTimeout(() => setToast(null), 3000);
   }}
@@ -1398,12 +1398,12 @@ const exportScript = async (format = "pdf") => {
                   Editing Draft
                   </p>
                   <p className="text-base font-semibold leading-tight text-[#44210f] dark:text-white">
-                    The original episode stays unchanged until you save this version as final.
+                    The original episode stays unchanged until you apply these updates.
                   </p>
                   <p className="max-w-3xl text-sm leading-6 text-[#9a5a2b] dark:text-white/68">
                   {draftRestored && draftSavedAt
-                    ? `Draft saved on ${formatDraftTime(draftSavedAt)}. Keep editing, restore the original, or save this draft as final when you're ready.`
-                    : "Draft ready. Keep editing, restore the original, or save this draft as final when you're ready."}
+                    ? `Draft saved on ${formatDraftTime(draftSavedAt)}. Keep editing, restore the original, or apply these updates when you're ready.`
+                    : "Draft ready. Keep editing, restore the original, or apply these updates when you're ready."}
                   </p>
                 </div>
               </div>
@@ -1465,7 +1465,7 @@ const exportScript = async (format = "pdf") => {
             <button
   onClick={() => {
     if (isEditingTitle) {
-      setToast({ type: "warning", message: "Apply or cancel the title draft before finalizing." });
+      setToast({ type: "warning", message: "Apply or cancel the title draft before applying updates." });
       setTimeout(() => setToast(null), 3000);
       return;
     }
@@ -1486,7 +1486,7 @@ const exportScript = async (format = "pdf") => {
   }`}
 >
   <Save className="w-4 h-4" />
-  {saving ? "Saving Final..." : "Save as Final"}
+  {saving ? "Applying Updates..." : "Apply Updates"}
 </button>
           </div>
         </div>
@@ -1882,7 +1882,7 @@ const exportScript = async (format = "pdf") => {
             Regenerate Audio?
           </h2>
           <p className="text-sm leading-6 text-neutral-600 dark:text-white/70">
-            Saving as final will regenerate the entire podcast audio to apply your changes.
+            Applying these updates will regenerate the full podcast audio so your latest edits are reflected everywhere.
             This may take a few moments.
           </p>
           <div className="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-500/10 dark:text-amber-300">
@@ -1924,7 +1924,7 @@ const exportScript = async (format = "pdf") => {
           }}
           className="flex-1 rounded-xl bg-purple-600 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_10px_22px_rgba(139,61,255,0.25)] transition hover:bg-purple-700"
         >
-          Generate Audio & Save
+          Apply & Regenerate Audio
         </button>
       </div>
     </div>

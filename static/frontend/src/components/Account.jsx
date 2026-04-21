@@ -2,10 +2,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { LogOut, Check, AlertCircle, AlertTriangle, Save, RefreshCcw, Bell, PlayCircle, Palette, Trash2 } from "lucide-react";
-import { sendPasswordResetEmail } from "firebase/auth";
 import { useTranslation } from "react-i18next";
 import { API_BASE } from "../utils/api";
-import { actionCodeSettings, auth } from "../firebaseClient";
 import { DEFAULT_ACCOUNT_PREFERENCES, loadAccountPreferences, saveAccountPreferences } from "../utils/accountPreferences";
 
 /* ---- Dark mode helper ---- */
@@ -80,8 +78,6 @@ const ACCOUNT_SECONDARY_BUTTON_CLASS =
   `${ACCOUNT_ACTION_BUTTON_CLASS} border border-black/15 text-black hover:bg-black/5 dark:border-white/15 dark:text-white dark:hover:bg-white/10`;
 const ACCOUNT_PRIMARY_BUTTON_CLASS =
   `${ACCOUNT_ACTION_BUTTON_CLASS} bg-black text-white hover:bg-black/90 dark:bg-white dark:text-black dark:hover:bg-white/90`;
-const ACCOUNT_BRAND_BUTTON_CLASS =
-  `${ACCOUNT_ACTION_BUTTON_CLASS} border border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100 dark:border-purple-400/20 dark:bg-purple-500/10 dark:text-purple-200 dark:hover:bg-purple-500/15`;
 const ACCOUNT_DANGER_BUTTON_CLASS =
   `${ACCOUNT_ACTION_BUTTON_CLASS} border border-red-500 bg-red-600 text-white hover:bg-red-700`;
 const ACCOUNT_STATUS_PILL_CLASS =
@@ -431,30 +427,22 @@ export default function Account() {
 
     setSendingResetLink(true);
     try {
-      try {
-        await sendPasswordResetEmail(auth, email, actionCodeSettings);
-      } catch (firebaseError) {
-        const res = await fetch(`${API_BASE}/api/account/password-reset-link`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-        });
-        const data = await res.json().catch(() => ({}));
+      const res = await fetch(`${API_BASE}/api/account/password-reset-link`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+      });
+      const data = await res.json().catch(() => ({}));
 
-        if (!res.ok) {
-          throw {
-            code: data?.code || firebaseError?.code || "",
-            message: data?.error || firebaseError?.message || t("account.passwordSendFailed"),
-          };
-        }
-
-        setShowResetPasswordModal(false);
-        showToast(t("account.passwordSent", { email: data?.email || email }), "success");
-        return;
+      if (!res.ok) {
+        throw {
+          code: data?.code || "",
+          message: data?.error || t("account.passwordSendFailed"),
+        };
       }
 
       setShowResetPasswordModal(false);
-      showToast(t("account.passwordSent", { email }), "success");
+      showToast(t("account.passwordSent", { email: data?.email || email }), "success");
     } catch (error) {
       const code = error?.code || "";
       let message = error?.message || t("account.passwordSendFailed");
@@ -648,49 +636,41 @@ export default function Account() {
             />
           </Field>
 
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 rounded-2xl border border-purple-200/70 dark:border-purple-400/20 bg-purple-50/70 dark:bg-purple-900/10 px-4 py-4">
-            <div>
-              <p className="font-semibold text-black dark:text-white">Profile actions</p>
-              <p className="text-sm text-gray-600 dark:text-gray-300">
-                Save or reset your profile changes.
-              </p>
-            </div>
-            <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap">
-              <button
-                type="button"
-                onClick={resetProfileChanges}
-                disabled={!hasUnsavedChanges || saving}
-                className={`${ACCOUNT_SECONDARY_BUTTON_CLASS} ${
-                  hasUnsavedChanges && !saving
-                    ? ""
-                    : "border-gray-200 text-gray-400 dark:border-gray-700 dark:text-gray-500"
-                }`}
-              >
-                <RefreshCcw className="w-4 h-4" />
-                Reset
-              </button>
-              <button
-                onClick={save}
-                disabled={saving || !hasUnsavedChanges}
-                className={`${ACCOUNT_PRIMARY_BUTTON_CLASS} ${
-                  hasUnsavedChanges
-                    ? ""
-                    : "bg-gray-200 text-gray-500 dark:bg-gray-700 dark:text-gray-400"
-                }`}
-              >
-                {saving ? (
-                  <>
-                    <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                    {t("account.saving")}
-                  </>
-                ) : (
-                  <>
-                    <Save className="w-4 h-4" />
-                    {t("account.save")}
-                  </>
-                )}
-              </button>
-            </div>
+          <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:justify-end">
+            <button
+              type="button"
+              onClick={resetProfileChanges}
+              disabled={!hasUnsavedChanges || saving}
+              className={`${ACCOUNT_SECONDARY_BUTTON_CLASS} ${
+                hasUnsavedChanges && !saving
+                  ? ""
+                  : "border-gray-200 text-gray-400 dark:border-gray-700 dark:text-gray-500"
+              }`}
+            >
+              <RefreshCcw className="w-4 h-4" />
+              Reset
+            </button>
+            <button
+              onClick={save}
+              disabled={saving || !hasUnsavedChanges}
+              className={`${ACCOUNT_PRIMARY_BUTTON_CLASS} ${
+                hasUnsavedChanges
+                  ? ""
+                  : "bg-gray-200 text-gray-500 dark:bg-gray-700 dark:text-gray-400"
+              }`}
+            >
+              {saving ? (
+                <>
+                  <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                  {t("account.saving")}
+                </>
+              ) : (
+                <>
+                  <Save className="w-4 h-4" />
+                  {t("account.save")}
+                </>
+              )}
+            </button>
           </div>
         </div>
       </Card>
@@ -791,24 +771,18 @@ export default function Account() {
             </div>
           </div>
 
-          <div className="rounded-2xl border border-black/10 bg-white/75 px-5 py-5 dark:border-white/10 dark:bg-white/[0.04]">
-            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-              <div>
-                <p className="font-semibold text-black dark:text-white">Log out</p>
-                <p className="text-sm text-gray-600 dark:text-gray-300">
-                  Sign out of your account on this device.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={handleLogout}
-                className={ACCOUNT_BRAND_BUTTON_CLASS}
-              >
-                <LogOut className="h-4 w-4" />
-                {t("account.logout")}
-              </button>
-            </div>
-          </div>
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="group flex w-full items-center gap-3 rounded-2xl border border-black/10 bg-white/75 px-5 py-4 text-left transition hover:border-black/15 hover:bg-black/[0.02] dark:border-white/10 dark:bg-white/[0.04] dark:hover:bg-white/[0.06]"
+          >
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-black/10 bg-black/[0.04] text-black transition group-hover:bg-black group-hover:text-white dark:border-white/10 dark:bg-white/[0.05] dark:text-white dark:group-hover:bg-white dark:group-hover:text-black">
+              <LogOut className="h-4 w-4" />
+            </span>
+            <span className="text-base font-semibold text-black dark:text-white">
+              {t("account.logout")}
+            </span>
+          </button>
 
           <div className="rounded-2xl border border-red-200/80 bg-red-50/80 px-5 py-5 dark:border-red-500/20 dark:bg-red-950/20">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -836,7 +810,6 @@ export default function Account() {
       <Toast message={toastMsg} type={toastType} />
       <PasswordResetModal
         open={showResetPasswordModal}
-        email={profile.email}
         sending={sendingResetLink}
         onCancel={closeResetPasswordModal}
         onConfirm={handleSendResetLink}
@@ -885,7 +858,6 @@ function Card({ title, subtitle, icon, children }) {
 
 function PasswordResetModal({
   open,
-  email,
   sending,
   onCancel,
   onConfirm,
@@ -912,11 +884,7 @@ function PasswordResetModal({
           </div>
         </div>
 
-        <div className="mt-5 space-y-4">
-          <div className="rounded-2xl border border-black/10 bg-black/[0.03] px-4 py-3 text-sm text-black/75 dark:border-white/10 dark:bg-white/[0.04] dark:text-white/75">
-            {email}
-          </div>
-
+        <div className="mt-5">
           <div className="flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
             <button
               type="button"

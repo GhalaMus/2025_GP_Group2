@@ -7,6 +7,7 @@ import {
   signInWithRedirect,
 } from "firebase/auth";
 
+import { ensureFirebaseClientReady } from "../firebaseClient";
 import { API_BASE } from "./api";
 
 function storeAuthSession({ token, user, remember = true }) {
@@ -48,8 +49,25 @@ function mapFirebaseAuthError(error, providerLabel) {
   if (code === "auth/operation-not-allowed") {
     return `${providerLabel} sign-in is not enabled in Firebase Authentication. Enable the ${providerLabel} provider in Firebase Auth first.`;
   }
+  if (code === "auth/app-not-authorized" || code === "auth/invalid-api-key") {
+    return `Firebase Authentication is not configured correctly for ${providerLabel}. Check the Firebase web app config and authorized domains, then try again.`;
+  }
+  if (code === "auth/network-request-failed") {
+    return `We couldn't reach Firebase while starting ${providerLabel} sign-in. Check your connection and try again.`;
+  }
 
   return error?.message || `${providerLabel} login failed. Please try again.`;
+}
+
+function providerLabelFromId(providerId) {
+  const raw = String(providerId || "").trim().toLowerCase();
+  if (raw.includes("github")) {
+    return "GitHub";
+  }
+  if (raw.includes("google")) {
+    return "Google";
+  }
+  return "OAuth";
 }
 
 async function exchangeFirebaseUser({
@@ -100,8 +118,20 @@ export async function completePendingSocialRedirect({
   auth,
   remember = true,
 }) {
+  ensureFirebaseClientReady();
   await setAuthPersistence(auth, remember);
-  const result = await getRedirectResult(auth);
+  let result;
+  try {
+    result = await getRedirectResult(auth);
+  } catch (error) {
+    throw new Error(
+      mapFirebaseAuthError(
+        error,
+        providerLabelFromId(error?.customData?.providerId)
+      )
+    );
+  }
+
   if (!result?.user) {
     return false;
   }
@@ -121,6 +151,7 @@ export async function authenticateWithSocialProvider({
   providerLabel,
   remember = true,
 }) {
+  ensureFirebaseClientReady();
   await setAuthPersistence(auth, remember);
 
   try {

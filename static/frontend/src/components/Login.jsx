@@ -1,34 +1,35 @@
 // src/components/Login.jsx
 import React, { useEffect, useState } from "react";
-import { Eye, EyeOff, Mail, Lock, ArrowLeft } from "lucide-react";
-import { auth, googleProvider, githubProvider, actionCodeSettings } from "../firebaseClient";
+import { Eye, EyeOff, Mail, Lock, ArrowLeft, CheckCircle2 } from "lucide-react";
+import {
+  auth,
+  googleProvider,
+  githubProvider,
+  actionCodeSettings,
+  ensureFirebaseClientReady,
+} from "../firebaseClient";
 import { API_BASE } from "../utils/api";
 import {
   authenticateWithSocialProvider,
   completePendingSocialRedirect,
 } from "../utils/socialAuth";
 import {
+  clearAuthRedirectIntent,
+  getAuthRedirectIntent,
+  readHashRedirectParams,
+  storeAuthRedirectIntent,
+} from "../utils/authRedirect";
+import {
   sendEmailVerification,
-  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signOut,
 } from "firebase/auth";
 
 const REMEMBERED_LOGIN_KEY = "rememberedLoginIdentifier";
-  
-function getRedirectParams() {
-  const hash = window.location.hash || "";
-  const qs = hash.includes("?") ? hash.split("?")[1] : "";
-  const params = new URLSearchParams(qs);
-  return {
-    redirect: params.get("redirect") || "",
-    id: params.get("id") || "",
-    from: params.get("from") || "",
-  };
-}
 
 function redirectAfterAuth() {
-  const { redirect, id, from } = getRedirectParams();
+  const { redirect, id, from } = getAuthRedirectIntent();
+  clearAuthRedirectIntent();
   if (redirect === "edit") {
     window.location.hash = "#/edit";
   } else if (redirect === "create") {
@@ -45,12 +46,90 @@ function looksLikeEmail(value) {
   return /\S+@\S+\.\S+/.test(String(value || "").trim());
 }
 
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function buildPasswordResetSuccessMessage(email) {
+  return `If an account exists for ${email}, a password reset link is on the way. Check your inbox and spam folder next.`;
+}
+
+function mapLoginError(error) {
+  const code = error?.code || "";
+
+  if (code === "auth/invalid-email") {
+    return "Enter a valid email address and try again.";
+  }
+  if (code === "auth/operation-not-allowed") {
+    return "Email/password login is disabled in Firebase Authentication. Enable it in Firebase Auth > Sign-in method.";
+  }
+  if (code === "auth/unauthorized-domain") {
+    return "This app URL is not authorized in Firebase Authentication yet. Add this domain in Firebase Auth > Settings > Authorized domains.";
+  }
+  if (code === "auth/app-not-authorized" || code === "auth/invalid-api-key") {
+    return "Firebase Authentication is not configured correctly for this web app yet. Check the Firebase web app settings and env vars.";
+  }
+  if (code === "auth/network-request-failed") {
+    return "We couldn't reach Firebase right now. Check your connection and try again.";
+  }
+  if (code === "auth/too-many-requests") {
+    return "Too many sign-in attempts were made in a short time. Wait a moment, then try again.";
+  }
+  if (code === "auth/user-disabled") {
+    return "This Firebase account is disabled. Re-enable it in Firebase Authentication before signing in.";
+  }
+  if (
+    code === "auth/wrong-password" ||
+    code === "auth/user-not-found" ||
+    code === "auth/invalid-credential"
+  ) {
+    return "Invalid email or password.";
+  }
+
+  if (error?.message) {
+    return error.message;
+  }
+
+  return "Failed to connect to the server. Please try again.";
+}
+
+function mapVerificationResendError(error) {
+  const code = error?.code || "";
+
+  if (
+    code === "auth/invalid-credential" ||
+    code === "auth/user-not-found" ||
+    code === "auth/wrong-password"
+  ) {
+    return "We couldn't resend the verification email. Check your email and password, then try again.";
+  }
+  if (code === "auth/too-many-requests") {
+    return "We sent too many verification emails recently. Wait a moment, then try again.";
+  }
+  if (code === "auth/operation-not-allowed") {
+    return "Email/password sign-in is disabled in Firebase Authentication. Enable it before resending verification emails.";
+  }
+  if (code === "auth/unauthorized-domain") {
+    return "This app URL is not authorized for Firebase email actions yet. Add this domain in Firebase Auth > Settings > Authorized domains.";
+  }
+  if (code === "auth/app-not-authorized" || code === "auth/invalid-api-key") {
+    return "Firebase Authentication is not configured correctly for this web app yet. Check the Firebase web app settings and env vars.";
+  }
+  if (code === "auth/network-request-failed") {
+    return "We couldn't reach Firebase right now. Check your connection and try again.";
+  }
+
+  return "We couldn't resend the verification email right now. Please try again.";
+}
+
 export default function Login() {
   const [mode, setMode] = useState("login"); // "login" | "reset"
   const [identifier, setIdentifier] = useState("");
   const [pwd, setPwd] = useState("");
   const [rememberMe, setRememberMe] = useState(false);
   const [resetEmail, setResetEmail] = useState("");
+  const [resetRequestComplete, setResetRequestComplete] = useState(false);
+  const [resetSubmittedEmail, setResetSubmittedEmail] = useState("");
 
   const [showPwd, setShowPwd] = useState(false);
 
@@ -58,6 +137,10 @@ export default function Login() {
   const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(false);
   const [pendingVerificationEmail, setPendingVerificationEmail] = useState("");
+
+  useEffect(() => {
+    storeAuthRedirectIntent(readHashRedirectParams());
+  }, []);
 
   useEffect(() => {
     const rememberedLogin = localStorage.getItem(REMEMBERED_LOGIN_KEY);
@@ -111,6 +194,8 @@ export default function Login() {
     setError("");
     setInfo("");
     setPendingVerificationEmail("");
+    setResetRequestComplete(false);
+    setResetSubmittedEmail("");
   };
 
   const switchToReset = () => {
@@ -118,6 +203,8 @@ export default function Login() {
     setError("");
     setInfo("");
     setPendingVerificationEmail("");
+    setResetRequestComplete(false);
+    setResetSubmittedEmail("");
     // Only prefill when the login field actually contains an email address.
     if (looksLikeEmail(identifier) && !resetEmail) {
       setResetEmail(identifier.trim());
@@ -141,15 +228,28 @@ export default function Login() {
     setLoading(true);
 
     try {
+      const trimmedIdentifier = identifier.trim();
+      const normalizedIdentifier = looksLikeEmail(trimmedIdentifier)
+        ? normalizeEmail(trimmedIdentifier)
+        : trimmedIdentifier;
+
       if (identifier.includes("@")) {
         try {
-          const credential = await signInWithEmailAndPassword(auth, identifier.trim(), pwd);
+          ensureFirebaseClientReady();
+          const credential = await signInWithEmailAndPassword(
+            auth,
+            normalizedIdentifier,
+            pwd
+          );
           const firebaseUser = credential.user;
 
           if (!firebaseUser.emailVerified) {
             await signOut(auth);
-            sessionStorage.setItem("wecast:pendingVerificationEmail", identifier.trim());
-            setPendingVerificationEmail(identifier.trim());
+            sessionStorage.setItem(
+              "wecast:pendingVerificationEmail",
+              normalizedIdentifier
+            );
+            setPendingVerificationEmail(normalizedIdentifier);
             setInfo("Your account is almost ready. Verify your email first, then log in.");
             setLoading(false);
             return;
@@ -187,7 +287,7 @@ export default function Login() {
           }
 
           if (rememberMe) {
-            localStorage.setItem(REMEMBERED_LOGIN_KEY, identifier.trim());
+            localStorage.setItem(REMEMBERED_LOGIN_KEY, normalizedIdentifier);
           } else {
             localStorage.removeItem(REMEMBERED_LOGIN_KEY);
           }
@@ -226,7 +326,11 @@ export default function Login() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ identifier, email: identifier, password: pwd }),
+        body: JSON.stringify({
+          identifier: normalizedIdentifier,
+          email: normalizedIdentifier,
+          password: pwd,
+        }),
       });
 
       let data = {};
@@ -274,7 +378,7 @@ export default function Login() {
       }
 
       if (rememberMe) {
-        localStorage.setItem(REMEMBERED_LOGIN_KEY, identifier.trim());
+        localStorage.setItem(REMEMBERED_LOGIN_KEY, normalizedIdentifier);
       } else {
         localStorage.removeItem(REMEMBERED_LOGIN_KEY);
       }
@@ -297,17 +401,21 @@ export default function Login() {
       redirectAfterAuth();
     } catch (err) {
       console.error("LOGIN NETWORK ERROR:", err);
-      setError("Failed to connect to the server. Please try again.");
+      setError(mapLoginError(err));
     } finally {
       setLoading(false);
     }
   };
 
 // ------------------ RESET PASSWORD SUBMIT ------------------
-  const handleResetSubmit = async (e) => {
+  const handleResetSubmitLegacy = async (e) => {
     e.preventDefault();
     setError("");
     setInfo("");
+
+    if (resetRequestComplete) {
+      return;
+    }
 
     if (!resetEmail.trim()) {
       setError("Enter the email address linked to your account.");
@@ -317,7 +425,34 @@ export default function Login() {
     setLoading(true);
 
     try {
-      const email = resetEmail.trim().toLowerCase();
+      const email = normalizeEmail(resetEmail);
+      if (!looksLikeEmail(email)) {
+        setError("Enter a valid email address to continue.");
+        setLoading(false);
+        return;
+      }
+
+      const res = await fetch(`${API_BASE}/api/password-reset-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw {
+          code: data?.code || "",
+          message: data?.error || "We couldn't send the reset email right now. Please try again.",
+        };
+      }
+
+      setResetEmail(email);
+      setResetSubmittedEmail(email);
+      setResetRequestComplete(true);
+      return;
+/*
+
       try {
         await sendPasswordResetEmail(auth, email, actionCodeSettings);
       } catch (firebaseError) {
@@ -343,6 +478,7 @@ export default function Login() {
       }
 
       setInfo("Check your email for a password reset link. If it doesn’t appear, check your spam folder.");
+*/
     } catch (err) {
       console.error("RESET PASSWORD ERROR:", err);
       const code = err?.code || "";
@@ -354,6 +490,74 @@ export default function Login() {
         setError("Password reset isn’t available on this domain yet. Please try again from the main WeCast app.");
       } else {
         setError(err?.message || "We couldn’t send the reset email right now. Please try again.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResetSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    setInfo("");
+
+    if (resetRequestComplete) {
+      return;
+    }
+
+    if (!resetEmail.trim()) {
+      setError("Enter the email address linked to your account.");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const email = normalizeEmail(resetEmail);
+      if (!looksLikeEmail(email)) {
+        setError("Enter a valid email address to continue.");
+        setLoading(false);
+        return;
+      }
+
+      const res = await fetch(`${API_BASE}/api/password-reset-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw {
+          code: data?.code || "",
+          message:
+            data?.error ||
+            "We couldn't send the reset email right now. Please try again.",
+        };
+      }
+
+      setResetEmail(email);
+      setResetSubmittedEmail(email);
+      setResetRequestComplete(true);
+    } catch (err) {
+      console.error("RESET PASSWORD ERROR:", err);
+      const code = err?.code || "";
+      if (code === "auth/invalid-email") {
+        setError("Enter a valid email address to continue.");
+      } else if (code === "auth/operation-not-allowed") {
+        setError(
+          "Password reset is unavailable right now. Please try again a little later."
+        );
+      } else if (code === "auth/unauthorized-domain") {
+        setError(
+          "Password reset isn't available on this domain yet. Please try again from the main WeCast app."
+        );
+      } else {
+        setError(
+          err?.message ||
+            "We couldn't send the reset email right now. Please try again."
+        );
       }
     } finally {
       setLoading(false);
@@ -386,7 +590,7 @@ export default function Login() {
     }
   };
 
-  const handleResendVerification = async () => {
+  const handleResendVerificationLegacy = async () => {
     setError("");
     setInfo("");
 
@@ -430,6 +634,45 @@ export default function Login() {
     }
   };
 
+  const handleResendVerification = async () => {
+    setError("");
+    setInfo("");
+
+    if (!identifier.trim() || !pwd.trim()) {
+      setError("Enter your email and password to resend the verification email.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      ensureFirebaseClientReady();
+      const email = normalizeEmail(identifier);
+      const credential = await signInWithEmailAndPassword(auth, email, pwd);
+      const firebaseUser = credential.user;
+
+      if (firebaseUser.emailVerified) {
+        await signOut(auth);
+        sessionStorage.removeItem("wecast:pendingVerificationEmail");
+        setPendingVerificationEmail("");
+        setInfo("Your email is already verified. You can log in now.");
+        return;
+      }
+
+      await sendEmailVerification(firebaseUser, actionCodeSettings);
+      await signOut(auth);
+
+      sessionStorage.setItem("wecast:pendingVerificationEmail", email);
+      setPendingVerificationEmail(email);
+      setInfo(
+        "A new verification email has been sent. Check your inbox and spam folder."
+      );
+    } catch (err) {
+      setError(mapVerificationResendError(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleGithubLogin = async () => {
     setError("");
     setInfo("");
@@ -454,6 +697,10 @@ export default function Login() {
       setLoading(false);
     }
   };
+
+  // Kept as no-op references while the migrated handlers settle in.
+  void handleResetSubmitLegacy;
+  void handleResendVerificationLegacy;
 
   // ------------------------------------------------------------------
   // UI
@@ -498,7 +745,7 @@ export default function Login() {
           )}
 
           {/* Heading */}
-          <div className="mb-6 text-center">
+          <div className={mode === "reset" && resetRequestComplete ? "hidden" : "mb-6 text-center"}>
             {mode === "login" ? (
               <>
                 <h2 className="text-2xl font-extrabold tracking-tight text-black dark:text-white sm:text-[2rem]">
@@ -510,6 +757,9 @@ export default function Login() {
                 <p className="mt-1 text-sm leading-6 text-black/60 dark:text-white/60">
                   Welcome back. Sign in to access your podcasts and drafts.
                 </p>
+                <p className="hidden text-sm text-black/60 dark:text-white/60 mt-1">
+                  Enter the email you use for WeCast. If it matches an account, we’ll send a reset link.
+                </p>
               </>
             ) : (
               <>
@@ -517,6 +767,9 @@ export default function Login() {
                   Reset your password
                 </h2>
                 <p className="text-sm text-black/60 dark:text-white/60 mt-1">
+                  Enter the email you use for WeCast. If it matches an account, we’ll send a reset link.
+                </p>
+                <p className="hidden text-sm text-black/60 dark:text-white/60 mt-1">
                   Enter your account email and we’ll send you a secure password reset link.
                 </p>
               </>
@@ -557,7 +810,7 @@ export default function Login() {
           {mode === "login" && (
             <form onSubmit={handleSubmit} className="space-y-5">
               {/* Email / Username */}
-              <div>
+              <div className={resetRequestComplete ? "hidden" : ""}>
                 <label className="block text-sm font-medium text-black dark:text-white mb-2">
                   Email or username
                 </label>
@@ -578,7 +831,7 @@ export default function Login() {
               </div>
 
               {/* Password */}
-              <div>
+              <div className={resetRequestComplete ? "hidden" : ""}>
                 <label className="form-label">Password</label>
                 <div className="relative">
                   <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 dark:text-neutral-400">
@@ -715,7 +968,7 @@ export default function Login() {
           {mode === "reset" && (
             <form onSubmit={handleResetSubmit} className="space-y-5">
               {/* Email */}
-              <div>
+              <div className={resetRequestComplete ? "hidden" : ""}>
                 <label className="block text-sm font-medium text-black dark:text-white mb-2">
                   Email address
                 </label>
@@ -729,18 +982,43 @@ export default function Login() {
                     placeholder="you@example.com"
                     value={resetEmail}
                     onChange={(e) => setResetEmail(e.target.value)}
+                    readOnly={resetRequestComplete}
+                    disabled={loading || resetRequestComplete}
                     required
                   />
                 </div>
               </div>
 
-              <button
-                type="submit"
-                className="w-full btn-primary"
-                disabled={loading}
-              >
-                {loading ? "Sending reset link..." : "Send reset link"}
-              </button>
+              {resetRequestComplete ? (
+                <div className="rounded-[28px] border border-emerald-200 bg-[linear-gradient(180deg,rgba(240,253,244,0.98),rgba(255,255,255,0.98))] px-5 py-5 text-left shadow-[0_18px_40px_rgba(5,150,105,0.12)] dark:border-emerald-500/25 dark:bg-[linear-gradient(180deg,rgba(6,95,70,0.22),rgba(10,10,10,0.96))]">
+                  <div className="flex items-start gap-3">
+                    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-emerald-200 bg-white/85 text-emerald-700 shadow-sm dark:border-emerald-400/20 dark:bg-emerald-500/12 dark:text-emerald-300">
+                      <CheckCircle2 className="h-5 w-5" />
+                    </span>
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-300">
+                        Email Sent
+                      </p>
+                      <p className="mt-1 text-2xl font-semibold tracking-tight text-emerald-950 dark:text-white">
+                        Check your email
+                      </p>
+                      <p className="mt-3 text-sm leading-7 text-emerald-800 dark:text-emerald-100/90">
+                        {buildPasswordResetSuccessMessage(resetSubmittedEmail)}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              {!resetRequestComplete ? (
+                <button
+                  type="submit"
+                  className="w-full btn-primary"
+                  disabled={loading}
+                >
+                  {loading ? "Sending reset link..." : "Send reset link"}
+                </button>
+              ) : null}
             </form>
           )}
         </div>

@@ -6,6 +6,7 @@ from flask import (
     session,
     jsonify,
     Response,
+    has_request_context,
 )
 from flask_cors import CORS
 from flask_session import Session
@@ -19,14 +20,15 @@ import os
 import re
 import requests
 import base64
-from firebase_admin import firestore, storage
+from firebase_admin import firestore
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
 import jwt
-from firebase_init import db, get_storage_bucket
+from firebase_init import db
 from PIL import Image, UnidentifiedImageError
 import json
 import html
+from urllib.parse import quote
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -93,12 +95,37 @@ def localize_script_structure(script: str, language: str) -> str:
 # App + Config
 # ------------------------------------------------------------
 
+
+def _configured_frontend_origins():
+    defaults = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://wecast-frontend.onrender.com",
+    ]
+    configured = []
+
+    raw_env = (os.getenv("FRONTEND_ORIGINS") or "").strip()
+    if raw_env:
+        for value in raw_env.split(","):
+            candidate = value.strip().rstrip("/")
+            if candidate and candidate not in configured:
+                configured.append(candidate)
+
+    for key in ("WECAST_APP_URL", "FRONTEND_URL"):
+        candidate = (os.getenv(key) or "").strip().rstrip("/")
+        if candidate and candidate not in configured:
+            configured.append(candidate)
+
+    for candidate in defaults:
+        normalized = candidate.rstrip("/")
+        if normalized and normalized not in configured:
+            configured.append(normalized)
+
+    return configured
+
+
 app = Flask(__name__)
-FRONTEND_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://wecast-frontend.onrender.com",  
-]
+FRONTEND_ORIGINS = _configured_frontend_origins()
 
 CORS(
     app,
@@ -200,6 +227,7 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+R2_PUBLIC_BASE_URL = (os.getenv("R2_PUBLIC_BASE_URL") or "").strip().rstrip("/")
 
 R2_ENDPOINT = (
     f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -253,11 +281,70 @@ def delete_from_r2(object_key: str):
 
     r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=object_key)
 
+
+def build_r2_asset_url(object_key: str, expires_in: int = 3600):
+    normalized_key = str(object_key or "").strip().lstrip("/")
+    if not normalized_key:
+        return ""
+
+    if R2_PUBLIC_BASE_URL:
+        return f"{R2_PUBLIC_BASE_URL}/{quote(normalized_key, safe='/')}"
+
+    return generate_r2_signed_url(normalized_key, expires_in=expires_in)
+
+
+def delete_from_r2_quietly(object_key: str, label: str = "R2 cleanup"):
+    normalized_key = str(object_key or "").strip()
+    if not normalized_key:
+        return
+
+    try:
+        delete_from_r2(normalized_key)
+    except Exception as exc:
+        print(f"{label} warning: {exc}")
+
+
+def resolve_podcast_media_urls(data, *, include_audio: bool = True, include_cover: bool = True):
+    payload = dict(data or {})
+
+    if include_audio:
+        audio_key = str(payload.get("audioKey") or "").strip()
+        if audio_key:
+            try:
+                payload["audioUrl"] = build_r2_asset_url(audio_key, expires_in=3600)
+            except Exception as exc:
+                print(f"Audio URL refresh failed: {exc}")
+
+    if include_cover:
+        cover_key = str(payload.get("coverPath") or "").strip()
+        if cover_key:
+            try:
+                payload["coverUrl"] = build_r2_asset_url(cover_key, expires_in=3600)
+            except Exception as exc:
+                print(f"Cover URL refresh failed: {exc}")
+
+    return payload
+
+
+def _normalize_public_url(value: str) -> str:
+    src = (value or "").strip()
+    if not src:
+        return ""
+    if src.startswith(("http://", "https://", "/")):
+        return src
+    return f"/{src.lstrip('/')}"
+
+
+def _delete_podcast_assets(data):
+    delete_from_r2_quietly((data or {}).get("audioKey") or "", label="Audio delete")
+    delete_from_r2_quietly((data or {}).get("coverPath") or "", label="Cover delete")
+
 print("DEBUG R2_ACCOUNT_ID present:", bool(R2_ACCOUNT_ID))
 print("DEBUG R2_ACCESS_KEY_ID present:", bool(R2_ACCESS_KEY_ID))
 print("DEBUG R2_SECRET_ACCESS_KEY present:", bool(R2_SECRET_ACCESS_KEY))
 print("DEBUG R2_BUCKET_NAME:", R2_BUCKET_NAME)
 print("DEBUG R2_ENDPOINT:", R2_ENDPOINT)
+print("DEBUG R2_PUBLIC_BASE_URL:", R2_PUBLIC_BASE_URL or "(signed URLs)")
 
 
 def is_reasonably_valid_email(email: str) -> bool:
@@ -322,9 +409,17 @@ def _wecast_frontend_url():
     base = (
         os.getenv("WECAST_APP_URL")
         or os.getenv("FRONTEND_URL")
-        or "https://wecast-frontend.onrender.com"
+        or ""
     ).strip()
-    return base.rstrip("/")
+    if base:
+        return base.rstrip("/")
+
+    if has_request_context():
+        origin = (request.headers.get("Origin") or "").strip()
+        if origin in FRONTEND_ORIGINS:
+            return origin.rstrip("/")
+
+    return "https://wecast-frontend.onrender.com"
 
 
 def _wecast_logo_url():
@@ -351,6 +446,182 @@ def _firebase_web_api_key():
         except Exception as env_error:
             print(f"Could not read frontend .env.local for Firebase API key: {env_error}")
     return ""
+
+
+def _password_reset_continue_url():
+    return f"{_wecast_frontend_url()}/#/login"
+
+
+def _legacy_password_seed():
+    seed = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+    return seed or "WeCastResetSeed9!"
+
+
+def _generate_firebase_password_reset_link(email):
+    from firebase_admin import auth as fb_auth
+
+    continue_url = _password_reset_continue_url()
+    if continue_url:
+        try:
+            action_code_settings = fb_auth.ActionCodeSettings(
+                url=continue_url,
+                handle_code_in_app=False,
+            )
+            return fb_auth.generate_password_reset_link(email, action_code_settings)
+        except TypeError:
+            pass
+        except Exception as link_error:
+            print(
+                f"Firebase password reset link with continue URL failed for {email}: {link_error}"
+            )
+
+    return fb_auth.generate_password_reset_link(email)
+
+
+def _provision_legacy_password_user(email, doc, data):
+    from firebase_admin import auth as fb_auth
+
+    normalized_email = (email or "").strip().lower()
+    display_name = (
+        data.get("displayName")
+        or data.get("name")
+        or normalized_email.split("@")[0]
+    ).strip()
+
+    # Legacy password accounts predate Firebase Auth email verification.
+    # Mark migrated users verified so they can complete the reset + login path.
+    email_verified = bool(data.get("emailVerified", True))
+    try:
+        user_record = fb_auth.create_user(
+            email=normalized_email,
+            password=_legacy_password_seed(),
+            display_name=display_name or None,
+            email_verified=email_verified,
+            disabled=False,
+        )
+    except Exception:
+        user_record = fb_auth.get_user_by_email(normalized_email)
+
+    if doc and doc.exists:
+        doc.reference.set(
+            {
+                "authProvider": "password",
+                "emailVerified": email_verified,
+                "firebaseUid": user_record.uid,
+                "firebasePasswordProvisionedAt": datetime.utcnow().isoformat(),
+            },
+            merge=True,
+        )
+
+    return user_record
+
+
+def _fallback_display_name(email, preferred=None):
+    cleaned = (preferred or "").strip()
+    if cleaned:
+        return cleaned
+
+    normalized_email = (email or "").strip().lower()
+    if "@" in normalized_email:
+        return normalized_email.split("@", 1)[0]
+    return normalized_email
+
+
+def _upsert_firebase_user_profile(
+    *,
+    email,
+    display_name="",
+    auth_provider="password",
+    email_verified=False,
+    firebase_uid="",
+    mark_login=False,
+):
+    normalized_email = (email or "").strip().lower()
+    if not normalized_email:
+        raise ValueError("Email is required.")
+
+    existing_doc = get_user_doc_by_candidates(normalized_email)
+    existing_data = (
+        existing_doc.to_dict() or {}
+        if existing_doc and existing_doc.exists
+        else {}
+    )
+    user_ref = (
+        existing_doc.reference
+        if existing_doc and existing_doc.exists
+        else db.collection("users").document(normalized_email)
+    )
+
+    existing_name = (
+        existing_data.get("displayName")
+        or existing_data.get("name")
+        or ""
+    ).strip()
+    resolved_name = _fallback_display_name(
+        normalized_email,
+        display_name or existing_name,
+    )
+    normalized_provider = normalize_auth_provider(
+        auth_provider,
+        existing_data.get("password_hash"),
+    )
+    now_iso = datetime.utcnow().isoformat()
+
+    payload = {
+        "email": normalized_email,
+        "authProvider": normalized_provider,
+        "emailVerified": bool(existing_data.get("emailVerified")) or bool(email_verified),
+    }
+
+    if firebase_uid:
+        payload["firebaseUid"] = firebase_uid
+
+    if display_name or not existing_name:
+        payload["name"] = resolved_name
+        payload["displayName"] = resolved_name
+
+    if not existing_data.get("username_lower") and resolved_name:
+        payload["username_lower"] = resolved_name.lower()
+
+    if mark_login:
+        payload["last_login"] = now_iso
+        payload["failed_attempts"] = 0
+        payload["lock_until"] = None
+
+    if not (existing_doc and existing_doc.exists):
+        payload.setdefault("name", resolved_name)
+        payload.setdefault("displayName", resolved_name)
+        payload.setdefault("username_lower", resolved_name.lower())
+        payload["bio"] = existing_data.get("bio", "")
+        payload["avatarUrl"] = existing_data.get("avatarUrl", "")
+        payload["created_at"] = existing_data.get("created_at") or now_iso
+        payload["role"] = existing_data.get("role") or "user"
+        payload["failed_attempts"] = existing_data.get("failed_attempts", 0)
+        payload["lock_until"] = existing_data.get("lock_until")
+    else:
+        if not existing_data.get("role"):
+            payload["role"] = "user"
+        if "bio" not in existing_data:
+            payload["bio"] = ""
+        if "avatarUrl" not in existing_data:
+            payload["avatarUrl"] = ""
+
+    user_ref.set(payload, merge=True)
+    final_doc = user_ref.get()
+    return final_doc.to_dict() or {}
+
+
+def _session_user_payload(data, fallback_email):
+    return {
+        "email": data.get("email", fallback_email),
+        "name": data.get("name") or data.get("displayName") or "",
+        "role": data.get("role", "user"),
+        "authProvider": normalize_auth_provider(
+            data.get("authProvider"),
+            data.get("password_hash"),
+        ),
+        "emailVerified": bool(data.get("emailVerified")),
+    }
 
 
 def _build_password_reset_email(display_name, email, reset_link):
@@ -473,21 +744,41 @@ def _send_reset_email_via_firebase(email):
     if not api_key:
         return False
 
+    endpoint = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={api_key}"
     payload = {
         "requestType": "PASSWORD_RESET",
         "email": email,
-        "continueUrl": f"{_wecast_frontend_url()}/#/login",
-        "canHandleCodeInApp": False,
     }
+    continue_url = _password_reset_continue_url()
+    if continue_url:
+        payload["continueUrl"] = continue_url
+        payload["canHandleCodeInApp"] = False
+
     response = requests.post(
-        f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={api_key}",
+        endpoint,
         headers={"Content-Type": "application/json"},
         json=payload,
         timeout=30,
     )
-    if not response.ok:
-        raise RuntimeError(f"Firebase reset email failed with status {response.status_code}: {response.text[:240]}")
-    return True
+    if response.ok:
+        return True
+
+    if continue_url:
+        fallback_response = requests.post(
+            endpoint,
+            headers={"Content-Type": "application/json"},
+            json={
+                "requestType": "PASSWORD_RESET",
+                "email": email,
+            },
+            timeout=30,
+        )
+        if fallback_response.ok:
+            return True
+
+    raise RuntimeError(
+        f"Firebase reset email failed with status {response.status_code}: {response.text[:240]}"
+    )
 
 
 def prepare_password_reset_delivery(email, strict=False):
@@ -496,30 +787,60 @@ def prepare_password_reset_delivery(email, strict=False):
     normalized_email = (email or "").strip().lower()
     doc = get_user_doc_by_candidates(normalized_email)
     data = doc.to_dict() or {} if doc and doc.exists else {}
+    stored_provider = normalize_auth_provider(
+        data.get("authProvider"),
+        data.get("password_hash"),
+    )
     user_record = None
+    migrated_from_legacy = False
     try:
         user_record = fb_auth.get_user_by_email(normalized_email)
     except fb_auth.UserNotFoundError:
         user_record = None
+
+    if not user_record:
+        if stored_provider in {"google", "github"}:
+            if strict:
+                return {"status": "provider_managed", "authProvider": stored_provider}
+            return {"status": "hidden"}
+
+        if data.get("password_hash"):
+            try:
+                user_record = _provision_legacy_password_user(normalized_email, doc, data)
+                migrated_from_legacy = True
+            except Exception as migration_error:
+                print(
+                    f"Legacy password account migration failed for {normalized_email}: {migration_error}"
+                )
+                if strict:
+                    return {"status": "unavailable", "authProvider": "password"}
+                return {"status": "hidden"}
+        else:
+            if strict:
+                return {"status": "unavailable", "authProvider": stored_provider or "unknown"}
+            return {"status": "hidden"}
 
     provider_ids = {
         (getattr(provider, "provider_id", "") or "").strip().lower()
         for provider in (getattr(user_record, "provider_data", None) or [])
         if (getattr(provider, "provider_id", "") or "").strip()
     }
+    has_password_provider = "password" in provider_ids or (
+        not provider_ids and stored_provider == "password"
+    )
 
-    auth_provider = normalize_auth_provider(data.get("authProvider"), data.get("password_hash"))
-    if user_record:
-        if "password" in provider_ids or not provider_ids:
-            auth_provider = "password"
-        elif "google.com" in provider_ids:
-            auth_provider = "google"
-        elif "github.com" in provider_ids:
-            auth_provider = "github"
+    if "google.com" in provider_ids or stored_provider == "google":
+        auth_provider = "google"
+    elif "github.com" in provider_ids or stored_provider == "github":
+        auth_provider = "github"
+    else:
+        auth_provider = "password"
 
-    if auth_provider != "password":
-        if strict:
+    if not has_password_provider:
+        if strict and auth_provider in {"google", "github"}:
             return {"status": "provider_managed", "authProvider": auth_provider}
+        if strict:
+            return {"status": "unavailable", "authProvider": auth_provider}
         return {"status": "hidden"}
 
     display_name = (
@@ -529,45 +850,63 @@ def prepare_password_reset_delivery(email, strict=False):
         or normalized_email.split("@")[0]
     ).strip()
 
-    if not user_record:
-        if not (doc and doc.exists):
-            return {"status": "hidden"}
-
-        temp_password = f"WeCast!{os.urandom(10).hex()}A1"
-        create_kwargs = {
+    try:
+        reset_link = _generate_firebase_password_reset_link(normalized_email)
+    except Exception as link_error:
+        print(f"Firebase password reset link generation failed for {normalized_email}: {link_error}")
+        return {
+            "status": "not_sent",
+            "delivery": "none",
+            "authProvider": "password",
             "email": normalized_email,
-            "password": temp_password,
-            "email_verified": True,
+            "migratedFromLegacy": migrated_from_legacy,
         }
-        if display_name:
-            create_kwargs["display_name"] = display_name
-        user_record = fb_auth.create_user(**create_kwargs)
+
+    delivery = ""
 
     try:
-        if _send_reset_email_via_firebase(normalized_email):
-            if doc and doc.exists:
-                doc.reference.set(
-                    {
-                        "authProvider": "password",
-                        "emailVerified": bool(data.get("emailVerified", True)),
-                        "last_password_reset_request": datetime.utcnow().isoformat(),
-                    },
-                    merge=True,
-                )
-            return {
-                "status": "sent",
-                "delivery": "firebase_server",
-                "authProvider": "password",
-                "email": normalized_email,
-            }
+        if _send_reset_email_via_resend(normalized_email, display_name, reset_link):
+            delivery = "resend"
     except Exception as send_error:
-        print(f"Firebase server reset email send failed for {normalized_email}: {send_error}")
+        print(f"Resend password reset email failed for {normalized_email}: {send_error}")
+
+    if not delivery:
+        try:
+            if _send_reset_email_via_firebase(normalized_email):
+                delivery = "firebase_server"
+        except Exception as send_error:
+            print(f"Firebase server reset email send failed for {normalized_email}: {send_error}")
+
+    if delivery:
+        if doc and doc.exists:
+            merge_payload = {
+                "authProvider": "password",
+                "emailVerified": bool(
+                    data.get("emailVerified", getattr(user_record, "email_verified", True))
+                ),
+                "last_password_reset_request": datetime.utcnow().isoformat(),
+                "last_password_reset_delivery": delivery,
+            }
+            firebase_uid = getattr(user_record, "uid", "") or data.get("firebaseUid", "")
+            if firebase_uid:
+                merge_payload["firebaseUid"] = firebase_uid
+
+            doc.reference.set(merge_payload, merge=True)
+
+        return {
+            "status": "sent",
+            "delivery": delivery,
+            "authProvider": "password",
+            "email": normalized_email,
+            "migratedFromLegacy": migrated_from_legacy,
+        }
 
     return {
         "status": "not_sent",
-        "delivery": "firebase_server",
+        "delivery": "none",
         "authProvider": "password",
         "email": normalized_email,
+        "migratedFromLegacy": migrated_from_legacy,
     }
 
 # ------------------------------------------------------------
@@ -720,6 +1059,7 @@ def save_generated_podcast_to_firestore(user_id: str, title: str, script_style: 
         "style": script_style,
         "speakersCount": len(speakers_info or []),
         "status": "draft",
+        "hasEditDraft": False,
         "createdAt": now,
         "lastEditedAt": now,
     })
@@ -1165,7 +1505,11 @@ Transcript:
         return []
 
 def build_chapters(word_timeline, transcript_text, language="en"):
-    proposed = generate_chapters_from_transcript(transcript_text, language=language)
+    try:
+        proposed = generate_chapters_from_transcript(transcript_text, language=language)
+    except Exception as exc:
+        print(f"Chapter generation failed, using fallback: {exc}")
+        proposed = []
 
     chapters = []
     used = set()
@@ -1712,7 +2056,7 @@ def _persist_avatar_to_r2(user_id: str, image_bytes: bytes, mime_type: str):
     object_key = f"avatars/{user_id}/{ts}.{ext}"
 
     upload_bytes_to_r2(image_bytes, object_key, mime_type)
-    signed_url = generate_r2_signed_url(object_key, expires_in=3600)
+    signed_url = build_r2_asset_url(object_key, expires_in=3600)
 
     return signed_url, object_key
 
@@ -1735,12 +2079,23 @@ def _persist_cover_to_storage_and_doc(podcast_id: str, cover_b64: str, mime_type
 
     cover_url = ""
     persist_error = ""
+    old_cover_path = ""
+
+    try:
+        existing_doc = db.collection("podcasts").document(podcast_id).get()
+        if existing_doc.exists:
+            old_cover_path = ((existing_doc.to_dict() or {}).get("coverPath") or "").strip()
+    except Exception:
+        old_cover_path = ""
 
     try:
         upload_bytes_to_r2(img_bytes, storage_path, mime_type)
-        cover_url = generate_r2_signed_url(storage_path, expires_in=3600)
+        cover_url = build_r2_asset_url(storage_path, expires_in=3600)
     except Exception as e:
         persist_error = f"r2_upload_failed: {e}"
+
+    if old_cover_path and old_cover_path != storage_path and not persist_error:
+        delete_from_r2_quietly(old_cover_path, label="Cover replace")
 
     db.collection("podcasts").document(podcast_id).set(
         {
@@ -1891,6 +2246,13 @@ def api_update_podcast(podcast_id):
 
     if mode == "discard_draft":
         draft_ref.delete()
+        podcast_ref.set(
+            {
+                "hasEditDraft": False,
+                "editDraftUpdatedAt": firestore.DELETE_FIELD,
+            },
+            merge=True,
+        )
         return jsonify(ok=True, mode=mode, message="Draft discarded", podcastId=podcast_id)
 
     payload = {
@@ -1909,6 +2271,13 @@ def api_update_podcast(podcast_id):
 
     if mode == "draft":
         draft_ref.set(payload, merge=True)
+        podcast_ref.set(
+            {
+                "hasEditDraft": True,
+                "editDraftUpdatedAt": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
         return jsonify(
             ok=True,
             mode=mode,
@@ -1970,6 +2339,13 @@ def api_update_podcast(podcast_id):
         print(f"DEBUG: Speakers saved")
 
     draft_ref.delete()
+    podcast_ref.set(
+        {
+            "hasEditDraft": False,
+            "editDraftUpdatedAt": firestore.DELETE_FIELD,
+        },
+        merge=True,
+    )
 
     return jsonify({
         "ok": True,
@@ -2130,14 +2506,7 @@ def api_me():
 
         if avatar_key:
             try:
-                avatar_url = generate_r2_signed_url(avatar_key, expires_in=3600)
-                user_ref.set(
-                    {
-                        "avatarUrl": avatar_url,
-                        "updatedAt": firestore.SERVER_TIMESTAMP,
-                    },
-                    merge=True,
-                )
+                avatar_url = build_r2_asset_url(avatar_key, expires_in=3600)
             except Exception as e:
                 print(f"Avatar signed URL refresh failed: {e}")
 
@@ -2167,6 +2536,11 @@ def api_profile_update():
     user_id = session.get("user_id") or get_current_user_email()
     if not user_id:
         return jsonify(error="Not logged in"), 401
+
+    user_ref = db.collection("users").document(user_id)
+    existing_doc = user_ref.get()
+    existing_data = existing_doc.to_dict() or {}
+    old_avatar_key = (existing_data.get("avatarKey") or "").strip()
 
     # Handle form data with possible file upload
     if request.content_type and 'multipart/form-data' in request.content_type:
@@ -2231,19 +2605,27 @@ def api_profile_update():
 
     try:
         # Update Firestore
-        user_ref = db.collection("users").document(user_id)
         user_ref.set(update_data, merge=True)
-        
+        if 'avatar_key' in locals() and old_avatar_key and old_avatar_key != avatar_key:
+            delete_from_r2_quietly(old_avatar_key, label="Avatar replace")
+
         # Get updated user data
         updated_doc = user_ref.get()
         updated_data = updated_doc.to_dict() or {}
+        response_avatar_url = avatar_url or updated_data.get('avatarUrl', '')
+        refreshed_avatar_key = (updated_data.get('avatarKey') or "").strip()
+        if refreshed_avatar_key and not response_avatar_url:
+            try:
+                response_avatar_url = build_r2_asset_url(refreshed_avatar_key, expires_in=3600)
+            except Exception as exc:
+                print(f"Avatar response URL refresh failed: {exc}")
         
         return jsonify({
             "ok": True,
             "message": "Profile updated successfully",
             "displayName": updated_data.get('name', updated_data.get('displayName', '')),
             "bio": updated_data.get('bio', ''),
-            "avatarUrl": updated_data.get('avatarUrl', ''),
+            "avatarUrl": response_avatar_url,
             "email": updated_data.get('email', ''),
             "handle": updated_data.get('handle', '')
         })
@@ -2270,14 +2652,7 @@ def api_profile_avatar():
         return jsonify(avatarUrl="")
 
     try:
-        signed_url = generate_r2_signed_url(avatar_key, expires_in=3600)
-        user_ref.set(
-            {
-                "avatarUrl": signed_url,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
+        signed_url = build_r2_asset_url(avatar_key, expires_in=3600)
         return jsonify(avatarUrl=signed_url)
     except Exception as e:
         return jsonify(error=str(e)), 500
@@ -2290,6 +2665,9 @@ def api_delete_account():
         return jsonify(error="Not logged in"), 401
 
     def _purge_podcast_document(ref):
+        snapshot = ref.get()
+        if snapshot.exists:
+            _delete_podcast_assets(snapshot.to_dict() or {})
         for sub_name in ("scripts", "speakers", "transcripts", "edits"):
             try:
                 for sub_doc in ref.collection(sub_name).stream():
@@ -2314,22 +2692,15 @@ def api_delete_account():
         for candidate in user_id_candidates(user_id):
             try:
                 user_ref = db.collection("users").document(candidate)
-                if user_ref.get().exists:
+                user_doc = user_ref.get()
+                if user_doc.exists:
+                    avatar_key = ((user_doc.to_dict() or {}).get("avatarKey") or "").strip()
+                    if avatar_key:
+                        delete_from_r2_quietly(avatar_key, label="Avatar delete")
                     user_ref.delete()
                     deleted_user_docs += 1
             except Exception as user_error:
                 print(f"User deletion error for {candidate}: {user_error}")
-
-        try:
-            bucket = get_storage_bucket()
-            for candidate in user_id_candidates(user_id):
-                for blob in bucket.list_blobs(prefix=f"avatars/{candidate}/"):
-                    try:
-                        blob.delete()
-                    except Exception:
-                        pass
-        except Exception as storage_error:
-            print(f"Avatar cleanup error: {storage_error}")
 
         session.clear()
         session.modified = True
@@ -2367,6 +2738,11 @@ def api_account_password_reset_link():
                 error="Password changes are managed by your sign-in provider.",
                 authProvider=result.get("authProvider", "unknown"),
             ), 409
+        if result.get("status") == "unavailable":
+            return jsonify(
+                error="Password reset is unavailable for this account right now.",
+                authProvider=result.get("authProvider", "unknown"),
+            ), 409
         if result.get("status") != "sent":
             return jsonify(error="Failed to prepare a password reset link."), 500
 
@@ -2386,7 +2762,7 @@ def api_password_reset_email():
 
     try:
         result = prepare_password_reset_delivery(email, strict=False)
-        if result.get("status") == "sent":
+        if result.get("status") in {"sent", "hidden"}:
             return jsonify(ok=True, **result)
         return jsonify(error="We couldn't send the password reset email right now."), 500
     except Exception as e:
@@ -2435,6 +2811,12 @@ def api_get_podcast(podcast_id):
 
     edit_draft = _serialize_edit_draft(_edit_draft_ref(podcast_id).get())
 
+    resolved_podcast_data = resolve_podcast_media_urls(
+        podcast_data,
+        include_audio=True,
+        include_cover=True,
+    )
+
     # Return all data the edit page needs
     return jsonify({
         "id": podcast_id,
@@ -2452,7 +2834,9 @@ def api_get_podcast(podcast_id):
         "outroMusic": podcast_data.get("outroMusic", ""),
         "category": podcast_data.get("category", ""),
         "language": podcast_data.get("language", "en"),
-        "audioUrl": podcast_data.get("audioUrl", ""),
+        "audioUrl": resolved_podcast_data.get("audioUrl", podcast_data.get("audioUrl", "")),
+        "audioKey": podcast_data.get("audioKey", ""),
+        "coverUrl": resolved_podcast_data.get("coverUrl", podcast_data.get("coverUrl", "")),
         "editDraft": edit_draft,
     })
     
@@ -2495,19 +2879,22 @@ def api_generate():
         # fallback to JWT header if you want
         user_id = get_current_user_email()
 
-    # require login to save, enforce it
-    if not user_id:
-        return jsonify(ok=False, error="Not logged in."), 401
+    is_guest_session = not bool(user_id)
 
-    podcast_id = save_generated_podcast_to_firestore(
-        user_id=user_id,
-        title=title,
-        script_style=script_style,
-        description=description,
-        script=script_template,
-        speakers_info=speakers_info,
-        language=ui_language,
-    )
+    if user_id:
+        podcast_id = save_generated_podcast_to_firestore(
+            user_id=user_id,
+            title=title,
+            script_style=script_style,
+            description=description,
+            script=script_template,
+            speakers_info=speakers_info,
+            language=ui_language,
+        )
+    else:
+        # Try WeCast guest flow: keep the draft in-session and defer persistence
+        # until the user signs up or explicitly saves later.
+        podcast_id = db.collection("podcasts").document().id
 
 
     session["create_draft"] = {
@@ -2519,6 +2906,8 @@ def api_generate():
         "script": script_template,
         "show_title": show_title,
         "title": title,
+        "language": ui_language,
+        "guestMode": is_guest_session,
     }
 
 
@@ -2595,6 +2984,9 @@ def api_episodes_list():
         return None
 
     def _purge_episode_document(ref):
+        snapshot = ref.get()
+        if snapshot.exists:
+            _delete_podcast_assets(snapshot.to_dict() or {})
         for sub_name in ("scripts", "speakers", "transcripts"):
             try:
                 for sub_doc in ref.collection(sub_name).stream():
@@ -2628,27 +3020,13 @@ def api_episodes_list():
             is_saved = status == "saved" or bool(data.get("savedAt"))
             legacy_saved = (
                 status == "draft"
-                and bool(data.get("audioUrl"))
+                and bool(data.get("audioUrl") or data.get("audioKey"))
                 and bool(data.get("summary"))
                 and isinstance(data.get("chapters"), list)
                 and len(data.get("chapters")) > 0
             )
         if not (is_saved or legacy_saved):
             continue
-
-        script_source = ""
-        script_final = ""
-        script_doc = (
-            db.collection("podcasts")
-            .document(doc.id)
-            .collection("scripts")
-            .document("main")
-            .get()
-        )
-        if script_doc.exists:
-            sdata = script_doc.to_dict() or {}
-            script_source = sdata.get("sourceText") or ""
-            script_final = sdata.get("finalScriptText") or ""
 
         title = data.get("title") or ""
         prefer_arabic_brief = _has_arabic(title) or (data.get("language") == "ar")
@@ -2657,31 +3035,24 @@ def api_episodes_list():
             [
                 data.get("summary") or "",
                 data.get("transcriptText") or "",
-                script_final,
-                script_source,
                 data.get("description") or "",
             ],
             prefer_arabic=prefer_arabic_brief,
         )
-
         payload = {
             "id": doc.id,
             "title": title or "Untitled Episode",
             "brief": _short_brief(brief),
             "audioUrl": data.get("audioUrl") or "",
+            "audioKey": data.get("audioKey") or "",
             "style": data.get("style") or "",
             "scriptStyle": data.get("style") or "",
-            "coverUrl": data.get("coverUrl") or "",
+            "coverUrl": data.get("coverThumbB64") and "" or (data.get("coverUrl") or ""),
             "coverThumbB64": data.get("coverThumbB64") or "",
             "createdAt": data.get("createdAt"),
         }
-
-        draft_data = _serialize_edit_draft(_edit_draft_ref(doc.id).get())
-        if draft_data:
-            payload["hasEditDraft"] = True
-            payload["editDraftUpdatedAt"] = draft_data.get("updatedAt") or draft_data.get("savedAt") or ""
-        else:
-            payload["hasEditDraft"] = False
+        payload["hasEditDraft"] = bool(data.get("hasEditDraft"))
+        payload["editDraftUpdatedAt"] = data.get("editDraftUpdatedAt") or ""
 
         if deleted_at:
             payload["deletedAt"] = deleted_at.isoformat()
@@ -2775,6 +3146,8 @@ def api_delete_episode(episode_id):
     data = doc.to_dict() or {}
     if data.get("userId") != user_id:
         return jsonify(error="Forbidden"), 403
+
+    _delete_podcast_assets(data)
 
     for sub_name in ("scripts", "speakers", "transcripts"):
         try:
@@ -3000,20 +3373,15 @@ def synthesize_audio_from_script(script: str, podcast_id: str = ""):
     if not safe_id:
         safe_id = "output"
 
-    local_dir = os.path.join("static", "generated_audio")
-    os.makedirs(local_dir, exist_ok=True)
     local_filename = f"output_{safe_id}.mp3"
-    local_path = os.path.join(local_dir, local_filename)
-
-    final_audio.export(local_path, format="mp3")
+    buffer = BytesIO()
+    final_audio.export(buffer, format="mp3")
+    mp3_bytes = buffer.getvalue()
 
     # Upload to R2
-    with open(local_path, "rb") as f:
-        mp3_bytes = f.read()
-
     object_key = f"episodes/{safe_id}/{local_filename}"
     upload_bytes_to_r2(mp3_bytes, object_key, "audio/mpeg")
-    signed_url = generate_r2_signed_url(object_key, expires_in=3600)
+    signed_url = build_r2_asset_url(object_key, expires_in=3600)
 
     return True, {
         "url": signed_url,
@@ -3048,6 +3416,7 @@ def api_audio():
 
     # keep audio in session 
     session["last_audio_url"] = result["url"]
+    session["last_audio_key"] = result.get("audioKey", "")
     session.modified = True
 
     # NEW: save live transcript (word timeline) to Firestore
@@ -3061,6 +3430,8 @@ def api_audio():
             if pdata.get("userId") == user_id:
                 words = result.get("words") or []
                 transcript_text = build_transcript_text_with_speakers(words)
+                old_audio_key = (pdata.get("audioKey") or "").strip()
+                new_audio_key = (result.get("audioKey") or "").strip()
 
                 if ui_language in ("en", "ar"):
                     podcast_ref.set({
@@ -3072,9 +3443,12 @@ def api_audio():
                     "transcriptText": transcript_text,
                     "transcriptUpdatedAt": firestore.SERVER_TIMESTAMP,
                     "audioUrl": result["url"],
-                    "audioKey": result.get("audioKey", ""),
+                    "audioKey": new_audio_key,
                     "audioUpdatedAt": firestore.SERVER_TIMESTAMP,
                 }, merge=True)
+
+                if old_audio_key and new_audio_key and old_audio_key != new_audio_key:
+                    delete_from_r2_quietly(old_audio_key, label="Audio replace")
 
                 # Save full word timeline in a subcollection doc
                 podcast_ref.collection("transcripts").document("main").set({
@@ -3122,7 +3496,7 @@ def get_audio(podcast_id):
         return jsonify(error="Audio not found"), 404
 
     try:
-        signed_url = generate_r2_signed_url(audio_key, expires_in=3600)
+        signed_url = build_r2_asset_url(audio_key, expires_in=3600)
         return jsonify(url=signed_url)
     except Exception as e:
         return jsonify(error=str(e)), 500
@@ -3235,7 +3609,8 @@ def get_podcast(podcast_id):
     if data.get("userId") != user_id:
         return jsonify(error="Forbidden"), 403
 
-    return jsonify(ok=True, podcast={**data, "id": podcast_id})
+    podcast_payload = resolve_podcast_media_urls(data, include_audio=True, include_cover=True)
+    return jsonify(ok=True, podcast={**podcast_payload, "id": podcast_id})
 
 
 @app.get("/api/podcasts/<podcast_id>/transcript")
@@ -3261,6 +3636,60 @@ def get_podcast_transcript(podcast_id):
     return jsonify(words=tdata.get("words") or [])
 
 
+@app.post("/api/podcasts/<podcast_id>/chapters/ensure")
+def ensure_podcast_chapters(podcast_id):
+    user_id = session.get("user_id") or get_current_user_email()
+    if not user_id:
+        return jsonify(error="Not logged in"), 401
+
+    ref = db.collection("podcasts").document(podcast_id)
+    doc = ref.get()
+    if not doc.exists:
+        return jsonify(error="Podcast not found"), 404
+
+    data = doc.to_dict() or {}
+    if data.get("userId") != user_id:
+        return jsonify(error="Forbidden"), 403
+
+    existing_chapters = data.get("chapters") or []
+    if isinstance(existing_chapters, list) and len(existing_chapters) > 0:
+        return jsonify(chapters=existing_chapters, rebuilt=False)
+
+    tdoc = ref.collection("transcripts").document("main").get()
+    tdata = tdoc.to_dict() or {}
+    words = tdata.get("words") or []
+
+    if not isinstance(words, list) or not words:
+        return jsonify(chapters=[], rebuilt=False)
+
+    transcript_text = (data.get("transcriptText") or "").strip()
+    if not transcript_text:
+        try:
+            transcript_text = build_transcript_text_with_speakers(words)
+        except Exception:
+            transcript_text = ""
+
+    language = (data.get("language") or "en").strip().lower()
+    if language not in ("en", "ar"):
+        language = "ar" if is_arabic(transcript_text) else "en"
+
+    chapters = build_chapters(words, transcript_text, language=language)
+    if not isinstance(chapters, list):
+        chapters = []
+
+    if chapters:
+        ref.set(
+            {
+                "chapters": chapters,
+                "chaptersUpdatedAt": firestore.SERVER_TIMESTAMP,
+                "transcriptText": transcript_text or data.get("transcriptText") or "",
+            },
+            merge=True,
+        )
+
+    return jsonify(chapters=chapters, rebuilt=bool(chapters))
+
+
 @app.post("/api/podcasts/<podcast_id>/save-all")
 def save_all_podcast(podcast_id):
     user_id = session.get("user_id") or get_current_user_email()
@@ -3278,7 +3707,10 @@ def save_all_podcast(podcast_id):
 
     payload = request.get_json(silent=True) or {}
     title = (payload.get("title") or "").strip()
-    audio_key = (payload.get("audioKey") or "").strip()
+    audio_url = (payload.get("audioUrl") or payload.get("audio_url") or "").strip()
+    audio_key = (payload.get("audioKey") or payload.get("audio_key") or "").strip()
+    if not audio_key:
+        audio_key = (session.get("last_audio_key") or "").strip()
     summary = payload.get("summary")
     chapters = payload.get("chapters")
     words = payload.get("words")
@@ -3292,6 +3724,8 @@ def save_all_podcast(podcast_id):
         updates["audioUpdatedAt"] = firestore.SERVER_TIMESTAMP
     if audio_key:
         updates["audioKey"] = audio_key
+        if not audio_url:
+            updates["audioUpdatedAt"] = firestore.SERVER_TIMESTAMP
     if summary is not None:
         updates["summary"] = summary
         updates["summaryUpdatedAt"] = firestore.SERVER_TIMESTAMP
@@ -3333,6 +3767,7 @@ def save_preview_snapshot():
     payload = request.get_json(silent=True) or {}
     title = (payload.get("title") or "").strip() or "Untitled Episode"
     audio_url = _normalize_public_url((payload.get("audioUrl") or payload.get("audio_url") or session.get("last_audio_url") or "").strip())
+    audio_key = (payload.get("audioKey") or payload.get("audio_key") or session.get("last_audio_key") or "").strip()
     summary = payload.get("summary")
     chapters = payload.get("chapters")
     words = payload.get("words")
@@ -3381,6 +3816,10 @@ def save_preview_snapshot():
     if audio_url:
         updates["audioUrl"] = audio_url
         updates["audioUpdatedAt"] = firestore.SERVER_TIMESTAMP
+    if audio_key:
+        updates["audioKey"] = audio_key
+        if not audio_url:
+            updates["audioUpdatedAt"] = firestore.SERVER_TIMESTAMP
     if summary is not None:
         updates["summary"] = summary
         updates["summaryUpdatedAt"] = firestore.SERVER_TIMESTAMP
@@ -3427,11 +3866,70 @@ def api_audio_last():
     Used so the audio does not 'disappear' after refresh or navigation.
     """
     url = session.get("last_audio_url")
-    return jsonify(url=url or None)
+    key = session.get("last_audio_key")
+    if key:
+        try:
+            url = build_r2_asset_url(key, expires_in=3600)
+            session["last_audio_url"] = url
+            session.modified = True
+        except Exception as exc:
+            print(f"Last audio URL refresh failed: {exc}")
+    return jsonify(url=url or None, audioKey=key or None)
 
 @app.route("/api/signup", methods=["POST"])
 def signup():
     data = request.get_json() or {}
+
+    id_token = (data.get("idToken") or "").strip()
+    if id_token:
+        from firebase_admin import auth as fb_auth
+
+        try:
+            decoded = fb_auth.verify_id_token(id_token)
+        except Exception as e:
+            print("Firebase signup sync error:", e)
+            return jsonify(
+                {
+                    "error": (
+                        "We couldn't verify the Firebase session. Make sure the backend "
+                        "Firebase service account matches the frontend Firebase project."
+                    )
+                }
+            ), 401
+
+        email = (decoded.get("email") or "").strip().lower()
+        display_name = (data.get("name") or decoded.get("name") or "").strip()
+
+        if not email:
+            return jsonify({"error": "Unable to read email from Firebase token"}), 400
+
+        try:
+            final_data = _upsert_firebase_user_profile(
+                email=email,
+                display_name=display_name,
+                auth_provider=decoded.get("firebase", {}).get("sign_in_provider", "password"),
+                email_verified=bool(decoded.get("email_verified")),
+                firebase_uid=decoded.get("uid") or "",
+                mark_login=False,
+            )
+        except Exception as sync_error:
+            print(f"Firebase signup profile sync failed for {email}: {sync_error}")
+            return jsonify(
+                {
+                    "error": "We couldn't finish setting up your WeCast profile. Please try again."
+                }
+            ), 500
+
+        return (
+            jsonify(
+                {
+                    "message": "Firebase signup synchronized successfully",
+                    "emailVerificationRequired": not bool(decoded.get("email_verified")),
+                    "user": _session_user_payload(final_data, email),
+                }
+            ),
+            201,
+        )
 
     email = (data.get("email") or "").strip().lower()
     password = (data.get("password") or "").strip()
@@ -3470,21 +3968,26 @@ def signup():
 
     user_ref.set(
         {
-             "email": email,
-        "name": name or "",
-        "displayName": name or "",
-        "bio": "",
-        "avatarUrl": "",
-        "username_lower": (name or "").lower(),
-        "password_hash": password_hash,
-        "created_at": datetime.utcnow().isoformat(),
-        "role": "user",
-        "failed_attempts": 0,
-        "lock_until": None,
+            "email": email,
+            "name": name or "",
+            "displayName": name or "",
+            "bio": "",
+            "avatarUrl": "",
+            "username_lower": (name or "").lower(),
+            "password_hash": password_hash,
+            "authProvider": "password",
+            "emailVerified": False,
+            "created_at": datetime.utcnow().isoformat(),
+            "last_login": datetime.utcnow().isoformat(),
+            "role": "user",
+            "failed_attempts": 0,
+            "lock_until": None,
         }
     )
 
     token = create_token(email, email)
+    session["user_id"] = email
+    session.modified = True
 
     return (
         jsonify(
@@ -3495,6 +3998,7 @@ def signup():
                     "email": email,
                     "name": name or "",
                     "role": "user",
+                    "authProvider": "password",
                 },
             }
         ),
@@ -3627,37 +4131,20 @@ def social_login():
 
     try:
         decoded = fb_auth.verify_id_token(id_token)
-        email = decoded.get("email")
-        name = decoded.get("name") or ""
+        email = (decoded.get("email") or "").strip().lower()
+        name = (data.get("name") or decoded.get("name") or "").strip()
 
         if not email:
             return jsonify(error="Unable to read email from Firebase token"), 400
 
-        user_ref = db.collection("users").document(email)
-        doc = user_ref.get()
-
-        auth_provider = decoded.get("firebase", {}).get("sign_in_provider", "oauth")
-
-        if not doc.exists:
-            # Create new user
-            user_ref.set({
-          "email": email,
-        "name": name,
-        "displayName": name,
-        "bio": "",
-        "avatarUrl": "",
-        "authProvider": auth_provider,
-        "created_at": datetime.utcnow().isoformat(),
-        "last_login": datetime.utcnow().isoformat(),
-        "role": "user",
-        "password_hash": None,
-            })
-        else:
-            user_ref.update({
-                "name": name,  
-                "authProvider": auth_provider,
-                "last_login": datetime.utcnow().isoformat(),
-            })
+        final_data = _upsert_firebase_user_profile(
+            email=email,
+            display_name=name,
+            auth_provider=decoded.get("firebase", {}).get("sign_in_provider", "oauth"),
+            email_verified=bool(decoded.get("email_verified")),
+            firebase_uid=decoded.get("uid") or "",
+            mark_login=True,
+        )
 
 
         token = create_token(email, email)
@@ -3668,17 +4155,17 @@ def social_login():
         return jsonify(
             message="Login successful",
             token=token,
-            user={
-                "email": email,
-                "name": name,
-                "role": "user",
-                "authProvider": auth_provider,
-            },
+            user=_session_user_payload(final_data, email),
         )
 
     except Exception as e:
-        print("ًlogin error:", e)
-        return jsonify(error="Invalid or expired OAuth token"), 401
+        print("Social login error:", e)
+        return jsonify(
+            error=(
+                "We couldn't verify your Firebase sign-in. Make sure the backend "
+                "Firebase service account matches the frontend Firebase project."
+            )
+        ), 401
 
 @app.post("/api/firebase-email-login")
 def firebase_email_login():
@@ -3693,7 +4180,7 @@ def firebase_email_login():
     try:
         decoded = fb_auth.verify_id_token(id_token)
         email = (decoded.get("email") or "").strip().lower()
-        name = (decoded.get("name") or "").strip()
+        name = (data.get("name") or decoded.get("name") or "").strip()
         email_verified = bool(decoded.get("email_verified"))
 
         if not email:
@@ -3702,38 +4189,14 @@ def firebase_email_login():
         if not email_verified:
             return jsonify(error="Please verify your email before signing in."), 403
 
-        user_ref = db.collection("users").document(email)
-        doc = user_ref.get()
-
-        user_payload = {
-            "email": email,
-            "authProvider": "password",
-            "emailVerified": True,
-            "last_login": datetime.utcnow().isoformat(),
-            "role": "user",
-            "password_hash": None,
-        }
-
-        if name:
-            user_payload["name"] = name
-            user_payload["displayName"] = name
-
-        if not doc.exists:
-            fallback_name = name or email.split("@")[0]
-            user_ref.set({
-                **user_payload,
-                "name": fallback_name,
-                "displayName": fallback_name,
-                "bio": "",
-                "avatarUrl": "",
-                "username_lower": fallback_name.lower(),
-                "created_at": datetime.utcnow().isoformat(),
-            })
-        else:
-            user_ref.set(user_payload, merge=True)
-
-        final_doc = user_ref.get()
-        final_data = final_doc.to_dict() or {}
+        final_data = _upsert_firebase_user_profile(
+            email=email,
+            display_name=name,
+            auth_provider=decoded.get("firebase", {}).get("sign_in_provider", "password"),
+            email_verified=email_verified,
+            firebase_uid=decoded.get("uid") or "",
+            mark_login=True,
+        )
 
         token = create_token(email, email)
         session["user_id"] = email
@@ -3742,16 +4205,16 @@ def firebase_email_login():
         return jsonify(
             message="Login successful",
             token=token,
-            user={
-                "email": final_data.get("email", email),
-                "name": final_data.get("name") or final_data.get("displayName") or "",
-                "role": final_data.get("role", "user"),
-                "authProvider": final_data.get("authProvider", "password"),
-            },
+            user=_session_user_payload(final_data, email),
         )
     except Exception as e:
         print("Firebase email login error:", e)
-        return jsonify(error="Invalid or expired Firebase token"), 401
+        return jsonify(
+            error=(
+                "We couldn't verify your Firebase sign-in. Make sure the backend "
+                "Firebase service account matches the frontend Firebase project."
+            )
+        ), 401
 
 def _normalize_public_url(url: str) -> str:
     return (url or "").strip()
@@ -3832,7 +4295,7 @@ def get_shared_podcast(podcast_id):
     except Exception as e:
         print("Public share route error:", str(e))
         return jsonify({"error": "Failed to load shared podcast"}), 500
-    
+
 
 # ------------------------------------------------------------
 # Main
